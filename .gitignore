@@ -1,0 +1,24 @@
+# Virtual environments & Python artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Secrets & Google OAuth tokens
+.env
+credentials.json
+token.json
+
+# Runtime memory & conversation logs
+memory/
+*.db
+*.sqlite3
+
+# Editor & OS files
+.vscode/
+.DS_Store
+Thumbs.db
