@@ -1,802 +1,393 @@
-import getpass
+import datetime as dt
 import json
+import math
 import os
-import re
-import tomllib
-from contextvars import ContextVar
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
-from typing import Literal, cast
-from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
-from google.auth.credentials import Credentials as BaseCredentials
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials as OAuthUserCredentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+import secrets
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from langchain.agents import create_agent
-from langchain.tools import tool
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 from langchain_groq import ChatGroq
-from langchain_ollama import ChatOllama
-from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import SecretStr
 
-BASE_DIR = Path(__file__).resolve().parent
-
-# Automatically load environment variables from .env in the project folder
-load_dotenv(dotenv_path=BASE_DIR / ".env")
-
-MEM_ROOT = BASE_DIR / "memory" / "users"
-CREDENTIALS_FILE = BASE_DIR / "credentials.json"
-TOKEN_FILE = BASE_DIR / "token.json"
-
-# Read-only Gmail + read/write Calendar scopes (requires re-auth if expanded)
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/calendar.readonly",
-    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
-# Active user & session-only Google state (OAuth Client ID/Secret stay in RAM only)
-CURRENT_USER: ContextVar[str] = ContextVar("CURRENT_USER", default="default_user")
-EPHEMERAL_GOOGLE_CLIENT_CONFIG: ContextVar[dict | None] = ContextVar(
-    "EPHEMERAL_GOOGLE_CLIENT_CONFIG", default=None
-)
-EPHEMERAL_GOOGLE_CREDS: ContextVar[OAuthUserCredentials | None] = ContextVar(
-    "EPHEMERAL_GOOGLE_CREDS", default=None
-)
-SESSION_GOOGLE_EMAIL: ContextVar[str] = ContextVar("SESSION_GOOGLE_EMAIL", default="")
-TOML_GOOGLE_CLIENT_CONFIG: ContextVar[dict | None] = ContextVar(
-    "TOML_GOOGLE_CLIENT_CONFIG", default=None
-)
 
-def check_calendar_and_unread_mail(
-    gmail_query: str = "is:unread -in:sent",
-    max_calendar_events: int = 10,
-    max_emails: int = 10,
-) -> dict[str, str]:
-    """Run read-only checks for upcoming Google Calendar events and unread Gmail threads."""
-    calendar_output = list_upcoming_calendar_events.invoke(
-        {"max_results": max_calendar_events}
-    )
-    gmail_output = search_gmail.invoke(
-        {"query": gmail_query, "max_results": max_emails}
-    )
+def build_client_config(
+    client_id: str, client_secret: str, redirect_uri: str
+) -> Dict[str, Any]:
     return {
-        "calendar": str(calendar_output),
-        "unread_emails": str(gmail_output),
-    }
-
-def sanitize_user_id(raw_name: str) -> str:
-    """Normalize a user's name/ID into a safe folder name."""
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", raw_name.strip().lower()).strip("_")
-    return cleaned or "default_user"
-
-
-def set_active_user(raw_name: str) -> str:
-    """Set the active user context and ensure their memory directories exist."""
-    user_id = sanitize_user_id(raw_name)
-    CURRENT_USER.set(user_id)
-    init_memory_files(user_id)
-    return user_id
-
-
-def get_user_paths(user_id: str | None = None) -> dict[str, Path]:
-    uid = sanitize_user_id(user_id or CURRENT_USER.get())
-    user_dir = MEM_ROOT / uid
-    return {
-        "root": user_dir,
-        "daily": user_dir / "daily",
-        "conv": user_dir / "conversations",
-        "profile": user_dir / "user_profile.json",
-        "ltm": user_dir / "long_term.json",
-    }
-
-
-def _build_desktop_client_config(
-    client_id: str,
-    client_secret: str,
-    project_id: str = "toml-oauth-client",
-    redirect_uris: list[str] | None = None,
-) -> dict:
-    return {
-        "installed": {
-            "client_id": client_id.strip(),
-            "project_id": project_id.strip() or "toml-oauth-client",
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_secret": client_secret.strip(),
-            "redirect_uris": redirect_uris or ["http://localhost"],
+            "redirect_uris": [redirect_uri],
         }
     }
 
 
-def apply_toml_secrets_mapping(secrets_data: dict[str, object]) -> None:
-    """Populate os.environ and optional TOML Google OAuth config from a secrets dict."""
-    for key, value in secrets_data.items():
-        if key == "google_oauth":
-            continue
-        if isinstance(value, (str, int, float, bool)) and key not in os.environ:
-            os.environ[str(key)] = str(value)
-
-    google_oauth = secrets_data.get("google_oauth")
-    if isinstance(google_oauth, dict):
-        cid = str(google_oauth.get("client_id", "") or "").strip()
-        csec = str(google_oauth.get("client_secret", "") or "").strip()
-        pid = str(google_oauth.get("project_id", "toml-oauth-client") or "").strip()
-        raw_redirects = google_oauth.get("redirect_uris")
-        redirects = (
-            [str(u).strip() for u in raw_redirects if str(u).strip()]
-            if isinstance(raw_redirects, list)
-            else ["http://localhost"]
-        )
-        if cid and csec:
-            TOML_GOOGLE_CLIENT_CONFIG.set(
-                _build_desktop_client_config(
-                    client_id=cid,
-                    client_secret=csec,
-                    project_id=pid,
-                    redirect_uris=redirects,
-                )
-            )
-        else:
-            TOML_GOOGLE_CLIENT_CONFIG.set(None)
-
-
-def load_toml_secrets(toml_path: Path | None = None) -> None:
-    """Load environment variables and optional [google_oauth] from a TOML file if present."""
-    candidates: list[Path] = []
-    if toml_path is not None:
-        candidates.append(toml_path)
-    else:
-        candidates.append(BASE_DIR / ".streamlit" / "secrets.toml")
-        candidates.append(BASE_DIR / "secrets.toml")
-
-    for path in candidates:
-        if path.exists() and path.is_file():
-            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
-            if isinstance(parsed, dict):
-                apply_toml_secrets_mapping(parsed)
-            break
-
-
-# Load TOML secrets automatically when agent_full is imported
-load_toml_secrets()
-
-
-def set_session_google_email(email: str) -> None:
-    """Store optional Google Mail ID for the active session."""
-    SESSION_GOOGLE_EMAIL.set(email.strip())
-
-
-def get_session_google_email() -> str:
-    return SESSION_GOOGLE_EMAIL.get().strip()
-
-
-def set_ephemeral_google_client(
-    client_id: str, client_secret: str, project_id: str = "ephemeral-session"
-) -> None:
-    """Store OAuth Desktop client details in memory only for the current session (never saved to disk)."""
-    cid = client_id.strip()
-    csec = client_secret.strip()
-    if not cid or not csec:
-        EPHEMERAL_GOOGLE_CLIENT_CONFIG.set(None)
-        EPHEMERAL_GOOGLE_CREDS.set(None)
-        return
-
-    EPHEMERAL_GOOGLE_CLIENT_CONFIG.set(
-        _build_desktop_client_config(
-            client_id=cid, client_secret=csec, project_id=project_id
-        )
-    )
-    EPHEMERAL_GOOGLE_CREDS.set(None)
-
-
-def clear_ephemeral_google_credentials() -> None:
-    """Wipe user-supplied Google client details, email hint, and session token from memory."""
-    EPHEMERAL_GOOGLE_CLIENT_CONFIG.set(None)
-    EPHEMERAL_GOOGLE_CREDS.set(None)
-    SESSION_GOOGLE_EMAIL.set("")
-
-
-def get_google_auth_status() -> dict[str, object]:
-    """Return a clear diagnostic snapshot of Google OAuth readiness without exposing secrets."""
-    ephemeral_client = EPHEMERAL_GOOGLE_CLIENT_CONFIG.get()
-    ephemeral_creds = EPHEMERAL_GOOGLE_CREDS.get()
-    toml_client = TOML_GOOGLE_CLIENT_CONFIG.get()
-    email_hint = get_session_google_email()
-
-    if ephemeral_client:
-        has_valid_token = bool(ephemeral_creds and ephemeral_creds.valid)
-        has_refresh = bool(
-            ephemeral_creds and getattr(ephemeral_creds, "refresh_token", None)
-        )
-        state = (
-            "Authenticated (RAM session token active)"
-            if (has_valid_token or has_refresh)
-            else "Ready for browser sign-in via custom RAM OAuth client on first Gmail/Calendar action."
-        )
-        return {
-            "mode": "ephemeral_ram",
-            "ready": True,
-            "authenticated": has_valid_token or has_refresh,
-            "email_hint": email_hint,
-            "message": state,
-        }
-
-    if TOKEN_FILE.exists():
-        return {
-            "mode": "token_file",
-            "ready": True,
-            "authenticated": True,
-            "email_hint": email_hint,
-            "message": "Saved token.json ready (will refresh automatically if needed).",
-        }
-
-    if toml_client:
-        return {
-            "mode": "toml_secrets",
-            "ready": True,
-            "authenticated": False,
-            "email_hint": email_hint,
-            "message": "[google_oauth] loaded from TOML secrets — Google browser sign-in will launch when needed.",
-        }
-
-    if CREDENTIALS_FILE.exists():
-        return {
-            "mode": "credentials_file",
-            "ready": True,
-            "authenticated": False,
-            "email_hint": email_hint,
-            "message": "credentials.json found — Google browser sign-in will launch when you read Gmail or use Calendar.",
-        }
-
-    return {
-        "mode": "unconfigured",
-        "ready": False,
-        "authenticated": False,
-        "email_hint": email_hint,
-        "message": "Add [google_oauth] to TOML secrets, place credentials.json in the project folder, or enter a custom OAuth client under Advanced.",
-    }
-
-
-def get_llm():
-    """Return ChatGroq or ChatOllama based on LLM_PROVIDER in env / TOML secrets."""
-    provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
-
-    if provider == "groq":
-        if not os.getenv("GROQ_API_KEY"):
-            raise EnvironmentError(
-                "LLM_PROVIDER is set to 'groq', but GROQ_API_KEY is missing in environment or TOML secrets."
-            )
-        model_name = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
-        print(f"Using Groq provider with model: {model_name}")
-        return ChatGroq(model=model_name, temperature=0)
-
-    if provider == "ollama":
-        model_name = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-        print(f"Using Ollama provider with model: {model_name}")
-        ollama_kwargs: dict[str, object] = {
-            "model": model_name,
-            "temperature": 0,
-        }
-        return ChatOllama(**ollama_kwargs)  # type: ignore[arg-type]
-
-    raise ValueError(
-        f"Unsupported LLM_PROVIDER '{provider}'. Expected 'ollama' or 'groq'."
-    )
-
-def init_memory_files(user_id: str | None = None) -> None:
-    paths = get_user_paths(user_id)
-    paths["root"].mkdir(parents=True, exist_ok=True)
-    paths["daily"].mkdir(parents=True, exist_ok=True)
-    paths["conv"].mkdir(parents=True, exist_ok=True)
-
-    if not paths["profile"].exists():
-        paths["profile"].write_text(
-            json.dumps(
-                {
-                    "user_id": paths["root"].name,
-                    "display_name": paths["root"].name,
-                    "google_email": "",
-                    "role_or_notes": "",
-                    "preferences": ["Keep responses concise and practical"],
-                    "ongoing_projects": [],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-    if not paths["ltm"].exists():
-        paths["ltm"].write_text(
-            json.dumps(
-                {
-                    "decisions": [],
-                    "facts": [],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-
-def save_user_onboarding_details(
-    user_id: str,
-    display_name: str,
-    role_or_notes: str = "",
-    google_email: str = "",
-) -> None:
-    """Save initial user details entered at startup into their user_profile.json."""
-    init_memory_files(user_id)
-    paths = get_user_paths(user_id)
-    profile = json.loads(paths["profile"].read_text(encoding="utf-8"))
-    if display_name.strip():
-        profile["display_name"] = display_name.strip()
-    if role_or_notes.strip():
-        profile["role_or_notes"] = role_or_notes.strip()
-    if google_email.strip():
-        profile["google_email"] = google_email.strip()
-    paths["profile"].write_text(json.dumps(profile, indent=2), encoding="utf-8")
-
-
-def append_daily_log(entry: str, user_id: str | None = None) -> None:
-    paths = get_user_paths(user_id)
-    today_file = paths["daily"] / f"{date.today().isoformat()}.md"
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    with today_file.open("a", encoding="utf-8") as f:
-        f.write(f"- [{timestamp}] {entry}\n")
-
-
-def load_profile_and_ltm_summary(user_id: str | None = None) -> str:
-    paths = get_user_paths(user_id)
-    init_memory_files(user_id)
-    profile = json.loads(paths["profile"].read_text(encoding="utf-8"))
-    ltm = json.loads(paths["ltm"].read_text(encoding="utf-8"))
-    today_file = paths["daily"] / f"{date.today().isoformat()}.md"
-    daily_text = (
-        today_file.read_text(encoding="utf-8")
-        if today_file.exists()
-        else "No entries yet today."
-    )
-
-    return (
-        f"Active User Profile:\n{json.dumps(profile, indent=2)}\n\n"
-        f"Long-Term Memory (Decisions & Facts):\n{json.dumps(ltm, indent=2)}\n\n"
-        f"Today's Activity Log ({date.today().isoformat()}):\n{daily_text}"
-    )
-
-
-def _run_oauth_flow(flow: InstalledAppFlow) -> OAuthUserCredentials:
-    """Run Google's browser OAuth consent flow with a timeout."""
-    login_hint = get_session_google_email()
-    print(
-        "\n[Google OAuth] Opening Google browser sign-in (timeout: 90s). "
-        "Sign in with your Google account in the browser..."
-    )
-    if login_hint:
-        print(f"[Google OAuth] Sign-in hint: {login_hint}")
-
-    auth_kwargs: dict[str, object] = {
-        "port": 0,
-        "open_browser": True,
-        "timeout_seconds": 90,
-    }
-    if login_hint:
-        auth_kwargs["login_hint"] = login_hint
-
-    try:
-        creds = flow.run_local_server(**auth_kwargs)  # type: ignore[arg-type]
-    except TimeoutError as exc:
-        raise TimeoutError(
-            "Google browser sign-in timed out after 90 seconds. Check your browser for the Google login page "
-            "and try again."
-        ) from exc
-
-    return cast(OAuthUserCredentials, creds)
-
-
-def get_google_credentials() -> BaseCredentials:
-    """
-    Authenticate via Google OAuth using session-only client details if provided,
-    saved token.json, TOML [google_oauth] config, or local credentials.json.
-    """
-    ephemeral_client = EPHEMERAL_GOOGLE_CLIENT_CONFIG.get()
-    ephemeral_creds = EPHEMERAL_GOOGLE_CREDS.get()
-
-    if ephemeral_client:
-        if ephemeral_creds and ephemeral_creds.valid:
-            return ephemeral_creds
-        if (
-            ephemeral_creds
-            and ephemeral_creds.expired
-            and getattr(ephemeral_creds, "refresh_token", None)
-        ):
-            ephemeral_creds.refresh(Request())
-            EPHEMERAL_GOOGLE_CREDS.set(ephemeral_creds)
-            return ephemeral_creds
-
-        flow = InstalledAppFlow.from_client_config(ephemeral_client, GOOGLE_SCOPES)
-        new_creds = _run_oauth_flow(flow)
-        EPHEMERAL_GOOGLE_CREDS.set(new_creds)
-        return new_creds
-
-    creds: BaseCredentials | None = None
-    if TOKEN_FILE.exists():
-        creds = OAuthUserCredentials.from_authorized_user_file(
-            str(TOKEN_FILE), GOOGLE_SCOPES
-        )
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and getattr(creds, "refresh_token", None):
-            creds.refresh(Request())
-        else:
-            toml_client = TOML_GOOGLE_CLIENT_CONFIG.get()
-            if toml_client:
-                flow = InstalledAppFlow.from_client_config(toml_client, GOOGLE_SCOPES)
-            elif CREDENTIALS_FILE.exists():
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    str(CREDENTIALS_FILE), GOOGLE_SCOPES
-                )
-            else:
-                raise FileNotFoundError(
-                    "No Google OAuth client found in TOML secrets ([google_oauth]), credentials.json, "
-                    "or session Advanced settings."
-                )
-            creds = _run_oauth_flow(flow)
-
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-
-    return creds
-
-
-def _parse_iso_with_tz(dt_str: str, tz_name: str) -> datetime:
-    """Parse an ISO-8601 datetime string and attach timezone if naive."""
-    tz = ZoneInfo(tz_name)
-    parsed = datetime.fromisoformat(dt_str.strip())
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=tz)
-    return parsed.astimezone(tz)
-
-
-# ---------------- MEMORY TOOLS (SCOPED TO ACTIVE USER) ----------------
-
-
-@tool
-def update_user_profile(
-    section: Literal["preferences", "ongoing_projects"], value: str
+def create_authorization_url(
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    pending_states: Dict[str, float],
 ) -> str:
-    """Save a user preference or an ongoing project into the active user's persistent profile."""
-    paths = get_user_paths()
-    profile = json.loads(paths["profile"].read_text(encoding="utf-8"))
-    items = profile.setdefault(section, [])
-    if value not in items:
-        items.append(value)
-    paths["profile"].write_text(json.dumps(profile, indent=2), encoding="utf-8")
-    append_daily_log(f"Updated profile ({section}): {value}")
-    return f"Saved '{value}' under profile.{section}."
+    state = secrets.token_urlsafe(32)
+    pending_states[state] = dt.datetime.now(dt.timezone.utc).timestamp()
+
+    flow = Flow.from_client_config(
+        build_client_config(client_id, client_secret, redirect_uri),
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        state=state,
+        prompt="consent",
+    )
+    return auth_url
 
 
-@tool
-def save_long_term_memory(kind: Literal["decisions", "facts"], item: str) -> str:
-    """Save a durable decision made or an important fact into the active user's long-term memory."""
-    paths = get_user_paths()
-    ltm = json.loads(paths["ltm"].read_text(encoding="utf-8"))
-    bucket = ltm.setdefault(kind, [])
-    entry = {"recorded_on": date.today().isoformat(), "content": item}
-    bucket.append(entry)
-    paths["ltm"].write_text(json.dumps(ltm, indent=2), encoding="utf-8")
-    append_daily_log(f"Saved long-term {kind[:-1]}: {item}")
-    return f"Saved to long-term {kind}: {item}"
+def exchange_oauth_code(
+    code: str,
+    received_state: str,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    pending_states: Dict[str, float],
+) -> Tuple[Dict[str, Any], str]:
+    if received_state not in pending_states:
+        raise ValueError("Invalid or expired OAuth state parameter.")
+    del pending_states[received_state]
+
+    flow = Flow.from_client_config(
+        build_client_config(client_id, client_secret, redirect_uri),
+        scopes=SCOPES,
+        state=received_state,
+        redirect_uri=redirect_uri,
+    )
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+
+    oauth2_service = build("oauth2", "v2", credentials=creds)
+    user_info = oauth2_service.userinfo().get().execute()
+
+    cred_dict = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": getattr(creds, "token_uri", None) or "https://oauth2.googleapis.com/token",
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": list(creds.scopes or []),
+    }
+    return cred_dict, user_info.get("email", "Connected User")
 
 
-@tool
-def log_daily_activity(note: str) -> str:
-    """Record a recent chat takeaway, task, or activity in today's daily memory log."""
-    append_daily_log(note)
-    return "Logged to today's daily memory."
+def creds_from_dict(raw: Optional[Dict[str, Any]]) -> Optional[Credentials]:
+    if not raw:
+        return None
+    return Credentials(
+        token=raw["token"],
+        refresh_token=raw.get("refresh_token"),
+        token_uri=raw["token_uri"],
+        client_id=raw["client_id"],
+        client_secret=raw["client_secret"],
+        scopes=raw.get("scopes", []),
+    )
 
 
-@tool
-def search_daily_memory(day_iso: str | None = None) -> str:
-    """Read the active user's daily memory for a specific date (YYYY-MM-DD), defaulting to today."""
-    paths = get_user_paths()
-    target_day = day_iso or date.today().isoformat()
-    target_file = paths["daily"] / f"{target_day}.md"
-    if not target_file.exists():
-        return f"No daily memory found for {target_day}."
-    return target_file.read_text(encoding="utf-8")
+def fetch_upcoming_meetings(
+    creds: Credentials, max_results: int = 8
+) -> List[Dict[str, str]]:
+    service = build("calendar", "v3", credentials=creds)
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    events_result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=now_iso,
+            maxResults=max_results,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+    meetings: List[Dict[str, str]] = []
+    for ev in events_result.get("items", []):
+        start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get(
+            "date", ""
+        )
+        meetings.append(
+            {
+                "summary": ev.get("summary", "(No title)"),
+                "start": start,
+                "location": ev.get("location", "").strip(),
+            }
+        )
+    return meetings
 
+def search_gmail_messages_raw(
+    creds: Credentials,
+    query: str = "",
+    max_results: int = 5,
+) -> List[Dict[str, str]]:
+    """Search Gmail messages using standard Gmail search syntax (e.g. 'is:unread', 'from:hr@company.com', 'flight')."""
+    service = build("gmail", "v1", credentials=creds)
+    safe_limit = max(1, min(int(max_results), 10))
 
-# ---------------- GOOGLE CONNECTIVITY TOOLS ----------------
+    list_kwargs: Dict[str, Any] = {
+        "userId": "me",
+        "maxResults": safe_limit,
+    }
+    if query.strip():
+        list_kwargs["q"] = query.strip()
 
+    resp = service.users().messages().list(**list_kwargs).execute()
+    messages = resp.get("messages", [])
 
-@tool
-def search_gmail(query: str = "is:unread", max_results: int = 5) -> str:
-    """Search Gmail messages in read-only mode using a Gmail search query."""
-    try:
-        creds = get_google_credentials()
-        service = build("gmail", "v1", credentials=creds)
-        res = (
+    results: List[Dict[str, str]] = []
+    for item in messages:
+        msg = (
             service.users()
             .messages()
-            .list(userId="me", q=query, maxResults=max(1, min(max_results, 15)))
-            .execute()
-        )
-        messages = res.get("messages", [])
-        if not messages:
-            append_daily_log(f"GMail read-only search '{query}': 0 matches")
-            return f"No Gmail messages found for query: {query}"
-
-        summaries = []
-        for msg_meta in messages:
-            msg = (
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=msg_meta["id"],
-                    format="metadata",
-                    metadataHeaders=["Subject", "From", "Date"],
-                )
-                .execute()
-            )
-            headers = {
-                h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])
-            }
-            snippet = msg.get("snippet", "").strip()
-            summaries.append(
-                f"- From: {headers.get('From', 'Unknown')}\n"
-                f"  Subject: {headers.get('Subject', '(No Subject)')}\n"
-                f"  Date: {headers.get('Date', '')}\n"
-                f"  Snippet: {snippet}"
-            )
-
-        append_daily_log(f"GMail read-only search '{query}': {len(summaries)} matches")
-        return "\n".join(summaries)
-    except Exception as exc:
-        return f"Gmail read-only error: {exc}"
-
-
-@tool
-def list_upcoming_calendar_events(max_results: int = 10) -> str:
-    """List upcoming events from the primary Google Calendar in read-only mode."""
-    try:
-        creds = get_google_credentials()
-        service = build("calendar", "v3", credentials=creds)
-        now_iso = datetime.now(timezone.utc).isoformat()
-        events_result = (
-            service.events()
-            .list(
-                calendarId="primary",
-                timeMin=now_iso,
-                maxResults=max(1, min(max_results, 25)),
-                singleEvents=True,
-                orderBy="startTime",
+            .get(
+                userId="me",
+                id=item["id"],
+                format="metadata",
+                metadataHeaders=["Subject", "From", "Date"],
             )
             .execute()
         )
-        events = events_result.get("items", [])
-        if not events:
-            append_daily_log("GCalendar read-only check: no upcoming events")
-            return "No upcoming events found on your primary Google Calendar."
-
-        lines = []
-        for event in events:
-            start = event.get("start", {}).get("dateTime") or event.get("start", {}).get(
-                "date", "Unknown start"
-            )
-            end = event.get("end", {}).get("dateTime") or event.get("end", {}).get(
-                "date", "Unknown end"
-            )
-            summary = event.get("summary", "(No Title)")
-            lines.append(f"- {summary} | Start: {start} | End: {end}")
-
-        append_daily_log(f"GCalendar read-only check: {len(lines)} events")
-        return "\n".join(lines)
-    except Exception as exc:
-        return f"Google Calendar read-only error: {exc}"
-
-
-@tool
-def create_calendar_event(
-    summary: str,
-    start_iso: str,
-    end_iso: str | None = None,
-    description: str = "",
-    location: str = "",
-    timezone_name: str = "Asia/Kolkata",
-) -> str:
-    """
-    Create a new event on the user's primary Google Calendar.
-    `start_iso` and `end_iso` should be ISO-8601 strings (e.g., '2026-11-23T15:00:00').
-    If `end_iso` is omitted, defaults to 30 minutes after `start_iso`.
-    """
-    try:
-        creds = get_google_credentials()
-        service = build("calendar", "v3", credentials=creds)
-
-        start_dt = _parse_iso_with_tz(start_iso, timezone_name)
-        end_dt = (
-            _parse_iso_with_tz(end_iso, timezone_name)
-            if end_iso
-            else start_dt + timedelta(minutes=30)
-        )
-
-        event_body: dict[str, object] = {
-            "summary": summary.strip(),
-            "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone_name},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone_name},
+        headers = {
+            h.get("name", ""): h.get("value", "")
+            for h in msg.get("payload", {}).get("headers", [])
         }
-        if description.strip():
-            event_body["description"] = description.strip()
-        if location.strip():
-            event_body["location"] = location.strip()
-
-        created = (
-            service.events()
-            .insert(calendarId="primary", body=event_body)
-            .execute()
+        results.append(
+            {
+                "id": item.get("id", ""),
+                "subject": headers.get("Subject", "(No subject)"),
+                "from": headers.get("From", "(Unknown sender)"),
+                "date": headers.get("Date", ""),
+                "snippet": msg.get("snippet", ""),
+            }
         )
-        link = created.get("htmlLink", "")
-        append_daily_log(f"Created calendar event: '{summary}' at {start_dt.isoformat()}")
-        return (
-            f"Created event '{created.get('summary', summary)}' "
-            f"from {start_dt.strftime('%Y-%m-%d %H:%M %Z')} to {end_dt.strftime('%Y-%m-%d %H:%M %Z')}."
-            + (f"\nLink: {link}" if link else "")
+    return results
+
+def geocode_place(place: str) -> Optional[Tuple[float, float, str]]:
+    resp = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": place, "format": "json", "limit": 1},
+        headers={"User-Agent": "PersonalAgentAchyut/1.0"},
+        timeout=8,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        return None
+    return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
+
+
+def get_route_distance_and_duration(
+    origin: Tuple[float, float], dest: Tuple[float, float]
+) -> Tuple[float, float]:
+    lat1, lon1 = origin
+    lat2, lon2 = dest
+    try:
+        osrm_url = (
+            f"https://router.project-osrm.org/route/v1/driving/"
+            f"{lon1},{lat1};{lon2},{lat2}"
         )
-    except Exception as exc:
-        return f"Google Calendar create error: {exc}"
+        resp = requests.get(osrm_url, params={"overview": "false"}, timeout=8)
+        resp.raise_for_status()
+        route = resp.json()["routes"][0]
+        distance_km = round(route["distance"] / 1000.0, 2)
+        duration_min = round(route["duration"] / 60.0, 1)
+        return max(distance_km, 0.5), max(duration_min, 3.0)
+    except Exception:
+        r = 6371.0
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (
+            math.sin(dlat / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(dlon / 2) ** 2
+        )
+        km = round(2 * r * math.asin(math.sqrt(a)) * 1.35, 2)
+        mins = round(km * 2.5, 1)
+        return max(km, 0.5), max(mins, 3.0)
 
 
-@tool
-def search_conversations(keyword: str) -> str:
-    """Search the active user's saved conversation transcripts for a keyword."""
-    paths = get_user_paths()
-    matches = []
-    for path in sorted(paths["conv"].glob("*")):
-        if path.is_file():
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            if keyword.lower() in text.lower():
-                matches.append(f"--- {path.name} ---\n{text[:600]}")
-    return (
-        "\n\n".join(matches)
-        if matches
-        else f"No past conversation files matched '{keyword}'."
+def compare_ride_fares(
+    distance_km: float, duration_min: float, surge_multiplier: float = 1.0
+) -> List[Dict[str, Any]]:
+    rate_cards = [
+        ("Rapido", "Bike Taxi", "Bike", 15, 6.5, 0.5, 25),
+        ("Rapido", "Auto", "Auto", 25, 11.0, 1.0, 35),
+        ("Rapido", "Cab Economy", "Cab", 45, 14.5, 1.2, 65),
+        ("Ola", "Bike", "Bike", 18, 7.0, 0.5, 28),
+        ("Ola", "Auto", "Auto", 28, 12.0, 1.0, 40),
+        ("Ola", "Mini / Prime", "Cab", 55, 16.0, 1.5, 80),
+        ("Uber", "Moto", "Bike", 18, 7.2, 0.6, 30),
+        ("Uber", "Auto", "Auto", 30, 12.5, 1.1, 45),
+        ("Uber", "Uber Go", "Cab", 58, 16.5, 1.5, 85),
+        ("SV Green", "EV Sedan / SUV", "EV Cab", 50, 14.0, 1.0, 75),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for provider, category, mode, base, per_km, per_min, min_fare in rate_cards:
+        raw = (base + distance_km * per_km + duration_min * per_min) * surge_multiplier
+        est = max(min_fare, round(raw))
+        low = max(min_fare, int(est * 0.92))
+        high = int(est * 1.12)
+        rows.append(
+            {
+                "provider": provider,
+                "ride_type": category,
+                "mode": mode,
+                "estimated_fare_inr": f"₹{low} – ₹{high}",
+                "midpoint_inr": est,
+                "est_time": f"{int(round(duration_min))} mins",
+            }
+        )
+    rows.sort(key=lambda r: r["midpoint_inr"])
+    return rows
+
+
+def build_commute_agent(
+    groq_api_key: str,
+    creds_dict: Optional[Dict[str, Any]] = None,
+    model_name: str = "llama-3.3-70b-versatile",
+):
+    """Build a LangGraph agent with Calendar meeting lookup, Gmail search, and ride fare comparison tools."""
+
+    @tool
+    def get_calendar_meetings(max_results: int = 8) -> str:
+        """Fetch upcoming Google Calendar events along with their scheduled start time and location."""
+        creds = creds_from_dict(creds_dict)
+        if creds is None:
+            return json.dumps(
+                {
+                    "connected": False,
+                    "message": "User has not connected their Google Calendar yet.",
+                }
+            )
+        try:
+            events = fetch_upcoming_meetings(creds, max_results=max_results)
+            return json.dumps({"connected": True, "meetings": events})
+        except Exception as exc:
+            return json.dumps({"connected": False, "error": str(exc)})
+
+    @tool
+    def compare_commute_fares(
+        pickup_location: str,
+        destination_location: str,
+        surge_multiplier: float = 1.0,
+    ) -> str:
+        """Compare estimated bike, auto, cab, and EV cab fares across Rapido, Ola, Uber, and SV Green between pickup_location and destination_location."""
+        origin_geo = geocode_place(pickup_location)
+        dest_geo = geocode_place(destination_location)
+        if not origin_geo or not dest_geo:
+            return json.dumps(
+                {
+                    "error": "Could not geocode pickup or destination. Please include area/city details."
+                }
+            )
+
+        dist_km, dur_min = get_route_distance_and_duration(
+            (origin_geo[0], origin_geo[1]),
+            (dest_geo[0], dest_geo[1]),
+        )
+        fares = compare_ride_fares(dist_km, dur_min, surge_multiplier=surge_multiplier)
+        return json.dumps(
+            {
+                "pickup_resolved": origin_geo[2],
+                "destination_resolved": dest_geo[2],
+                "distance_km": dist_km,
+                "duration_min": dur_min,
+                "surge_multiplier": surge_multiplier,
+                "fares": fares,
+            }
+        )
+
+    @tool
+    def search_gmail_messages(query: str = "", max_results: int = 5) -> str:
+        """Search the user's Gmail inbox/messages using a Gmail search query (such as 'meeting', 'invoice', 'is:unread', or a sender name) and return subject, sender, date, and snippet."""
+        creds = creds_from_dict(creds_dict)
+        if creds is None:
+            return json.dumps(
+                {
+                    "connected": False,
+                    "message": "User has not connected their Google account yet.",
+                }
+            )
+        try:
+            emails = search_gmail_messages_raw(
+                creds, query=query, max_results=max_results
+            )
+            return json.dumps({"connected": True, "query": query, "messages": emails})
+        except Exception as exc:
+            return json.dumps({"connected": False, "error": str(exc)})
+
+    resolved_key = str(groq_api_key or os.environ.get("GROQ_API_KEY") or "").strip()
+    llm = ChatGroq(
+        model=str(model_name),
+        api_key=SecretStr(resolved_key) if resolved_key else None,
+        temperature=0.2,
     )
-
-import re
-
-def _safe_thread_filename(thread_id: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]+', "_", thread_id)
-
-def save_conversation_turn(
-    thread_id: str, user_msg: str, assistant_msg: str, user_id: str | None = None
-) -> None:
-    paths = get_user_paths(user_id)
-    safe_name = _safe_thread_filename(thread_id)
-    conv_file = paths["conv"] / f"{safe_name}.jsonl"
-    record = {
-        "timestamp": datetime.now().isoformat(),
-        "user": user_msg,
-        "assistant": assistant_msg,
-    }
-    with conv_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
-
-
-def load_recent_conversation_messages(
-    thread_id: str, user_id: str | None = None
-) -> list[dict[str, str]]:
-    """Reload saved messages for a user's thread when returning to the app."""
-    paths = get_user_paths(user_id)
-    safe_name = _safe_thread_filename(thread_id)
-    conv_file = paths["conv"] / f"{safe_name}.jsonl"
-    if not conv_file.exists():
-        return []
-    messages: list[dict[str, str]] = []
-    for line in conv_file.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        messages.append({"role": "user", "content": item["user"]})
-        messages.append({"role": "assistant", "content": item["assistant"]})
-    return messages
-
-def prompt_ephemeral_google_details() -> str:
-    print("\n--- Google Mail & Calendar Access (Google Browser Sign-In) ---")
-    print(
-        "Enter your Google Mail ID to pre-hint your account on Google's browser sign-in page. "
-        "We never ask for or store your Google password. Optional custom OAuth Client ID/Secret "
-        "stay in RAM only if provided."
-    )
-    google_email = input("Google Mail ID (optional, press Enter to skip): ").strip()
-    set_session_google_email(google_email)
-
-    client_id = input("Custom OAuth Client ID (optional, press Enter to skip): ").strip()
-    if not client_id:
-        set_ephemeral_google_client("", "")
-        return google_email
-
-    client_secret = getpass.getpass("Custom OAuth Client Secret (hidden input): ").strip()
-    if not client_secret:
-        set_ephemeral_google_client("", "")
-        print("Client Secret was empty; skipped custom OAuth client.\n")
-        return google_email
-
-    set_ephemeral_google_client(client_id=client_id, client_secret=client_secret)
-    print("Custom OAuth client loaded in RAM for this session only (not saved).\n")
-    return google_email
-
-
-def main() -> None:
-    print("=== Personal AI Agent Setup ===")
-    raw_name = input("Enter your name or User ID: ").strip() or "default_user"
-    role_notes = input("Role / brief note (optional, press Enter to skip): ").strip()
-
-    user_id = set_active_user(raw_name)
-    google_email = prompt_ephemeral_google_details()
-    save_user_onboarding_details(
-        user_id=user_id,
-        display_name=raw_name,
-        role_or_notes=role_notes,
-        google_email=google_email,
-    )
-
-    llm = get_llm()
-    checkpointer = InMemorySaver()
-    context_snapshot = load_profile_and_ltm_summary(user_id)
 
     system_prompt = (
-    "You are a personal AI assistant. "
-    "Tailor your answers to the active user profile below and save updates to their isolated memory. "
-    "Whenever the user asks to check their calendar, schedule, or upcoming events, call "
-    "`list_upcoming_calendar_events`. Whenever they ask to check unread, recent, or specific emails, "
-    "call `search_gmail` with an appropriate Gmail search query.\n\n"
-    f"{context_snapshot}"
+        "You are a helpful personal assistant in India. "
+        "When a user asks about upcoming meetings or wants to travel to a meeting location, "
+        "call `get_calendar_meetings` first to check meeting locations. "
+        "When a user asks to check, find, or summarize emails, call `search_gmail_messages` "
+        "with a concise Gmail search query. "
+        "When comparing ride prices between two places or to an office/meeting venue, "
+        "call `compare_commute_fares` and present a clear comparison across Rapido, Ola, Uber, and SV Green "
+        "in INR (₹), noting that fares are estimates rather than live metered quotes."
     )
-    agent = create_agent(
+
+    return create_agent(
         model=llm,
-        tools=[
-            update_user_profile,
-            save_long_term_memory,
-            log_daily_activity,
-            search_daily_memory,
-            search_gmail,
-            list_upcoming_calendar_events,
-            create_calendar_event,
-            search_conversations,
-        ],
+        tools=[get_calendar_meetings, compare_commute_fares, search_gmail_messages],
         system_prompt=system_prompt,
-        checkpointer=checkpointer,
     )
 
-    thread_id = f"{user_id}-{date.today().isoformat()}"
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-    print(f"\nWelcome, {raw_name}! Isolated profile active at: memory/users/{user_id}/")
-    print(f"Thread: {thread_id}. Type 'exit' to quit.\n")
 
-    try:
-        while True:
-            user_input = input("You: ").strip()
-            if user_input.lower() in {"exit", "quit"}:
-                break
-            if not user_input:
-                continue
+def run_agent_turn(
+    agent,
+    history: List[Dict[str, str]],
+    user_message: str,
+) -> Tuple[str, List[Dict[str, str]]]:
+    """Run one conversational turn through LangGraph and return assistant reply + tool trace."""
+    lc_messages = []
+    for msg in history:
+        if msg["role"] == "user":
+            lc_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            lc_messages.append(AIMessage(content=msg["content"]))
+    lc_messages.append(HumanMessage(content=user_message))
 
-            append_daily_log(f"Chat user: {user_input}", user_id)
-            result = agent.invoke(
-                {"messages": [{"role": "user", "content": user_input}]},
-                config=config,
-            )
-            reply = result["messages"][-1].content
-            append_daily_log(f"Chat assistant: {reply[:160]}", user_id)
-            save_conversation_turn(thread_id, user_input, reply, user_id)
-            print(f"\nAgent: {reply}\n")
-    finally:
-        clear_ephemeral_google_credentials()
+    state_out = agent.invoke({"messages": lc_messages})
+    all_msgs = state_out.get("messages", [])
 
+    tool_events: List[Dict[str, str]] = []
+    final_reply = ""
+    for m in all_msgs:
+        if isinstance(m, ToolMessage):
+            tool_events.append({"tool": str(m.name or "tool"), "output": str(m.content)})
+        elif isinstance(m, AIMessage) and m.content:
+            final_reply = str(m.content)
 
-if __name__ == "__main__":
-    main()
+    return final_reply, tool_events
