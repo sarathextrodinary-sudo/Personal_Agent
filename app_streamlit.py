@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agent_full import (
     append_daily_log,
+    apply_toml_secrets_mapping,
     clear_ephemeral_google_credentials,
     create_calendar_event,
     get_google_auth_status,
@@ -31,6 +32,19 @@ from agent_full import (
 )
 
 
+def sync_streamlit_secrets() -> None:
+    """Load environment variables and optional [google_oauth] from st.secrets."""
+    try:
+        raw_secrets = dict(st.secrets)
+    except Exception:
+        return
+    if raw_secrets:
+        apply_toml_secrets_mapping(raw_secrets)
+
+
+sync_streamlit_secrets()
+
+
 def _clean_session_str(key: str) -> str:
     val: object = st.session_state.get(key)
     return val.strip() if isinstance(val, str) else ""
@@ -40,6 +54,15 @@ def _is_google_policy_accepted() -> bool:
     return bool(st.session_state.get("google_policy_accepted", False))
 
 
+def _default_model_for_provider(provider: str) -> str:
+    if provider.strip().lower() == "groq":
+        return (
+            os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b").strip()
+            or "qwen/qwen3.8-27b"
+        )
+    return os.getenv("OLLAMA_MODEL", "qwen3:8b").strip() or "qwen3:8b"
+
+
 def build_llm_from_ui(provider: str, model_name: str):
     cleaned_provider = provider.strip().lower()
     cleaned_model = model_name.strip()
@@ -47,11 +70,17 @@ def build_llm_from_ui(provider: str, model_name: str):
     if cleaned_provider == "groq":
         if not os.getenv("GROQ_API_KEY"):
             raise EnvironmentError(
-                "GROQ_API_KEY is not set. Add it to your .env file before selecting Groq."
+                "GROQ_API_KEY is not set. Add it to .streamlit/secrets.toml, Streamlit Cloud Secrets, or .env."
             )
-        return ChatGroq(model=cleaned_model or "qwen/qwen3-32b", temperature=0)
+        return ChatGroq(
+            model=cleaned_model or _default_model_for_provider("groq"),
+            temperature=0,
+        )
 
-    return ChatOllama(model=cleaned_model or "qwen3:8b", temperature=0)
+    return ChatOllama(
+        model=cleaned_model or _default_model_for_provider("ollama"),
+        temperature=0,
+    )
 
 
 def sync_ephemeral_google_from_session() -> None:
@@ -86,10 +115,13 @@ def get_cached_agent(
 ):
     llm = build_llm_from_ui(provider, model_name)
     system_prompt = (
-        "You are a personal AI assistant. "
-        "Tailor your answers to the active user profile below and save updates to their isolated memory.\n\n"
-        f"{context_snapshot}"
-    )
+    "You are a personal AI assistant. "
+    "Tailor your answers to the active user profile below and save updates to their isolated memory. "
+    "Whenever the user asks to check their calendar, schedule, or upcoming events, call "
+    "`list_upcoming_calendar_events`. Whenever they ask to check unread, recent, or specific emails, "
+    "call `search_gmail` with an appropriate Gmail search query.\n\n"
+    f"{context_snapshot}"
+)
     return create_agent(
         model=llm,
         tools=[
@@ -116,8 +148,8 @@ def render_google_acceptance_policy() -> None:
         "saved in your profile if accepted.\n"
         "- **Permissions:** Read-only Gmail (`gmail.readonly`) and Google Calendar event "
         "read/create (`calendar.readonly`, `calendar.events`).\n"
-        "- **Credentials:** Uses `credentials.json` automatically if present; optional custom OAuth "
-        "Client ID/Secret under *Advanced* stay in RAM for this session only."
+        "- **Credentials:** Reads `[google_oauth]` from TOML secrets or `credentials.json` if "
+        "present; optional custom OAuth Client ID/Secret under *Advanced* stay in RAM only."
     )
 
 
@@ -131,7 +163,7 @@ def render_google_status_box() -> None:
         st.caption("Accept the policy above to enable Gmail & Calendar access.")
     elif mode in {"ephemeral_ram", "token_file"}:
         st.success(msg)
-    elif mode == "credentials_file":
+    elif mode in {"toml_secrets", "credentials_file"}:
         st.info(msg)
     else:
         st.warning(msg)
@@ -231,6 +263,7 @@ def render_user_onboarding() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Personal AI Agent", page_icon="🤖", layout="wide")
+    sync_streamlit_secrets()
 
     if "active_user_id" not in st.session_state:
         render_user_onboarding()
@@ -260,6 +293,48 @@ def main() -> None:
         if active_mail and _is_google_policy_accepted():
             st.caption(f"Google Mail: `{active_mail}` (Policy Accepted)")
 
+        if st.button("Check Calendar & Unread Mail", key=f"check_google_{user_id}"):
+            quick_prompt = "Check my upcoming calendar events and my unread emails."
+            current_messages = st.session_state.get("messages")
+            if not isinstance(current_messages, list):
+                current_messages = []
+                st.session_state.messages = current_messages
+
+            active_provider = str(
+                st.session_state.get("provider_select", os.getenv("LLM_PROVIDER", "groq"))
+            )
+            active_model = str(
+                st.session_state.get("model_name_input", _default_model_for_provider(active_provider))
+            )
+            raw_thread = str(st.session_state.get("active_thread", "default"))
+            active_scoped_thread = f"{user_id}::{raw_thread}"
+
+            current_messages.append({"role": "user", "content": quick_prompt})
+            append_daily_log(
+                f"Streamlit user ({active_provider}:{active_model}): {quick_prompt}",
+                user_id,
+            )
+            with st.spinner("Checking Calendar & Gmail..."):
+                try:
+                    quick_agent = get_cached_agent(
+                        user_id=user_id,
+                        provider=active_provider,
+                        model_name=active_model,
+                        context_snapshot=load_profile_and_ltm_summary(user_id),
+                    )
+                    result = quick_agent.invoke(
+                        {"messages": [{"role": "user", "content": quick_prompt}]},
+                        config={"configurable": {"thread_id": active_scoped_thread}},
+                    )
+                    reply = str(result["messages"][-1].content)
+                except Exception as exc:
+                    reply = f"Model/Agent error: {exc}"
+            current_messages.append({"role": "assistant", "content": reply})
+            append_daily_log(f"Streamlit assistant: {reply[:160]}", user_id)
+            save_conversation_turn(active_scoped_thread, quick_prompt, reply, user_id)
+            st.rerun()
+
+
         if st.button("Switch User", key=f"switch_user_{user_id}"):
             clear_ephemeral_google_credentials()
             for key in [
@@ -271,6 +346,8 @@ def main() -> None:
                 "session_google_email",
                 "ephemeral_google_client_id",
                 "ephemeral_google_client_secret",
+                f"last_provider_{user_id}",
+                f"model_input_{user_id}",
             ]:
                 st.session_state.pop(key, None)
             st.rerun()
@@ -346,22 +423,29 @@ def main() -> None:
 
         st.divider()
         st.header("Model & Provider")
+        provider_key = f"provider_select_{user_id}"
+        last_provider_key = f"last_provider_{user_id}"
+        model_key = f"model_input_{user_id}"
+
         selected_provider = st.selectbox(
             "Provider",
             options=["ollama", "groq"],
             index=0 if default_provider == "ollama" else 1,
-            key=f"provider_select_{user_id}",
+            key=provider_key,
         )
-        default_model = (
-            os.getenv("OLLAMA_MODEL", "qwen3:8b")
-            if selected_provider == "ollama"
-            else os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
-        )
+
+        # Reset Model Name automatically when the user switches Provider
+        if st.session_state.get(last_provider_key) != selected_provider:
+            st.session_state[last_provider_key] = selected_provider
+            st.session_state[model_key] = _default_model_for_provider(selected_provider)
+        elif model_key not in st.session_state:
+            st.session_state[model_key] = _default_model_for_provider(selected_provider)
+
         raw_model = st.text_input(
             "Model Name",
-            value=default_model,
-            key=f"model_input_{user_id}",
+            key=model_key,
         )
+        default_model = _default_model_for_provider(selected_provider)
         selected_model = (
             raw_model.strip()
             if isinstance(raw_model, str) and raw_model.strip()

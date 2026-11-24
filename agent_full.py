@@ -2,6 +2,7 @@ import getpass
 import json
 import os
 import re
+import tomllib
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -45,7 +46,26 @@ EPHEMERAL_GOOGLE_CREDS: ContextVar[OAuthUserCredentials | None] = ContextVar(
     "EPHEMERAL_GOOGLE_CREDS", default=None
 )
 SESSION_GOOGLE_EMAIL: ContextVar[str] = ContextVar("SESSION_GOOGLE_EMAIL", default="")
+TOML_GOOGLE_CLIENT_CONFIG: ContextVar[dict | None] = ContextVar(
+    "TOML_GOOGLE_CLIENT_CONFIG", default=None
+)
 
+def check_calendar_and_unread_mail(
+    gmail_query: str = "is:unread -in:sent",
+    max_calendar_events: int = 10,
+    max_emails: int = 10,
+) -> dict[str, str]:
+    """Run read-only checks for upcoming Google Calendar events and unread Gmail threads."""
+    calendar_output = list_upcoming_calendar_events.invoke(
+        {"max_results": max_calendar_events}
+    )
+    gmail_output = search_gmail.invoke(
+        {"query": gmail_query, "max_results": max_emails}
+    )
+    return {
+        "calendar": str(calendar_output),
+        "unread_emails": str(gmail_output),
+    }
 
 def sanitize_user_id(raw_name: str) -> str:
     """Normalize a user's name/ID into a safe folder name."""
@@ -73,6 +93,78 @@ def get_user_paths(user_id: str | None = None) -> dict[str, Path]:
     }
 
 
+def _build_desktop_client_config(
+    client_id: str,
+    client_secret: str,
+    project_id: str = "toml-oauth-client",
+    redirect_uris: list[str] | None = None,
+) -> dict:
+    return {
+        "installed": {
+            "client_id": client_id.strip(),
+            "project_id": project_id.strip() or "toml-oauth-client",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_secret": client_secret.strip(),
+            "redirect_uris": redirect_uris or ["http://localhost"],
+        }
+    }
+
+
+def apply_toml_secrets_mapping(secrets_data: dict[str, object]) -> None:
+    """Populate os.environ and optional TOML Google OAuth config from a secrets dict."""
+    for key, value in secrets_data.items():
+        if key == "google_oauth":
+            continue
+        if isinstance(value, (str, int, float, bool)) and key not in os.environ:
+            os.environ[str(key)] = str(value)
+
+    google_oauth = secrets_data.get("google_oauth")
+    if isinstance(google_oauth, dict):
+        cid = str(google_oauth.get("client_id", "") or "").strip()
+        csec = str(google_oauth.get("client_secret", "") or "").strip()
+        pid = str(google_oauth.get("project_id", "toml-oauth-client") or "").strip()
+        raw_redirects = google_oauth.get("redirect_uris")
+        redirects = (
+            [str(u).strip() for u in raw_redirects if str(u).strip()]
+            if isinstance(raw_redirects, list)
+            else ["http://localhost"]
+        )
+        if cid and csec:
+            TOML_GOOGLE_CLIENT_CONFIG.set(
+                _build_desktop_client_config(
+                    client_id=cid,
+                    client_secret=csec,
+                    project_id=pid,
+                    redirect_uris=redirects,
+                )
+            )
+        else:
+            TOML_GOOGLE_CLIENT_CONFIG.set(None)
+
+
+def load_toml_secrets(toml_path: Path | None = None) -> None:
+    """Load environment variables and optional [google_oauth] from a TOML file if present."""
+    candidates: list[Path] = []
+    if toml_path is not None:
+        candidates.append(toml_path)
+    else:
+        candidates.append(BASE_DIR / ".streamlit" / "secrets.toml")
+        candidates.append(BASE_DIR / "secrets.toml")
+
+    for path in candidates:
+        if path.exists() and path.is_file():
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                apply_toml_secrets_mapping(parsed)
+            break
+
+
+# Load TOML secrets automatically when agent_full is imported
+load_toml_secrets()
+
+
 def set_session_google_email(email: str) -> None:
     """Store optional Google Mail ID for the active session."""
     SESSION_GOOGLE_EMAIL.set(email.strip())
@@ -93,18 +185,11 @@ def set_ephemeral_google_client(
         EPHEMERAL_GOOGLE_CREDS.set(None)
         return
 
-    config_dict = {
-        "installed": {
-            "client_id": cid,
-            "project_id": project_id.strip() or "ephemeral-session",
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_secret": csec,
-            "redirect_uris": ["http://localhost"],
-        }
-    }
-    EPHEMERAL_GOOGLE_CLIENT_CONFIG.set(config_dict)
+    EPHEMERAL_GOOGLE_CLIENT_CONFIG.set(
+        _build_desktop_client_config(
+            client_id=cid, client_secret=csec, project_id=project_id
+        )
+    )
     EPHEMERAL_GOOGLE_CREDS.set(None)
 
 
@@ -119,6 +204,7 @@ def get_google_auth_status() -> dict[str, object]:
     """Return a clear diagnostic snapshot of Google OAuth readiness without exposing secrets."""
     ephemeral_client = EPHEMERAL_GOOGLE_CLIENT_CONFIG.get()
     ephemeral_creds = EPHEMERAL_GOOGLE_CREDS.get()
+    toml_client = TOML_GOOGLE_CLIENT_CONFIG.get()
     email_hint = get_session_google_email()
 
     if ephemeral_client:
@@ -148,6 +234,15 @@ def get_google_auth_status() -> dict[str, object]:
             "message": "Saved token.json ready (will refresh automatically if needed).",
         }
 
+    if toml_client:
+        return {
+            "mode": "toml_secrets",
+            "ready": True,
+            "authenticated": False,
+            "email_hint": email_hint,
+            "message": "[google_oauth] loaded from TOML secrets — Google browser sign-in will launch when needed.",
+        }
+
     if CREDENTIALS_FILE.exists():
         return {
             "mode": "credentials_file",
@@ -162,20 +257,20 @@ def get_google_auth_status() -> dict[str, object]:
         "ready": False,
         "authenticated": False,
         "email_hint": email_hint,
-        "message": "Place credentials.json in the project folder or enter a custom OAuth Client ID & Secret under Advanced.",
+        "message": "Add [google_oauth] to TOML secrets, place credentials.json in the project folder, or enter a custom OAuth client under Advanced.",
     }
 
 
 def get_llm():
-    """Return ChatGroq or ChatOllama based on LLM_PROVIDER in .env or environment."""
+    """Return ChatGroq or ChatOllama based on LLM_PROVIDER in env / TOML secrets."""
     provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 
     if provider == "groq":
         if not os.getenv("GROQ_API_KEY"):
             raise EnvironmentError(
-                "LLM_PROVIDER is set to 'groq', but GROQ_API_KEY is missing in .env."
+                "LLM_PROVIDER is set to 'groq', but GROQ_API_KEY is missing in environment or TOML secrets."
             )
-        model_name = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
+        model_name = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
         print(f"Using Groq provider with model: {model_name}")
         return ChatGroq(model=model_name, temperature=0)
 
@@ -191,7 +286,6 @@ def get_llm():
     raise ValueError(
         f"Unsupported LLM_PROVIDER '{provider}'. Expected 'ollama' or 'groq'."
     )
-
 
 def init_memory_files(user_id: str | None = None) -> None:
     paths = get_user_paths(user_id)
@@ -306,7 +400,7 @@ def _run_oauth_flow(flow: InstalledAppFlow) -> OAuthUserCredentials:
 def get_google_credentials() -> BaseCredentials:
     """
     Authenticate via Google OAuth using session-only client details if provided,
-    otherwise using local project credentials.json/token.json.
+    saved token.json, TOML [google_oauth] config, or local credentials.json.
     """
     ephemeral_client = EPHEMERAL_GOOGLE_CLIENT_CONFIG.get()
     ephemeral_creds = EPHEMERAL_GOOGLE_CREDS.get()
@@ -338,14 +432,18 @@ def get_google_credentials() -> BaseCredentials:
         if creds and creds.expired and getattr(creds, "refresh_token", None):
             creds.refresh(Request())
         else:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError(
-                    "credentials.json was not found in the project folder and no custom OAuth client "
-                    "was entered under Advanced. Add credentials.json or enter a custom OAuth Client ID & Secret."
+            toml_client = TOML_GOOGLE_CLIENT_CONFIG.get()
+            if toml_client:
+                flow = InstalledAppFlow.from_client_config(toml_client, GOOGLE_SCOPES)
+            elif CREDENTIALS_FILE.exists():
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(CREDENTIALS_FILE), GOOGLE_SCOPES
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_FILE), GOOGLE_SCOPES
-            )
+            else:
+                raise FileNotFoundError(
+                    "No Google OAuth client found in TOML secrets ([google_oauth]), credentials.json, "
+                    "or session Advanced settings."
+                )
             creds = _run_oauth_flow(flow)
 
         TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
@@ -568,12 +666,17 @@ def search_conversations(keyword: str) -> str:
         else f"No past conversation files matched '{keyword}'."
     )
 
+import re
+
+def _safe_thread_filename(thread_id: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]+', "_", thread_id)
 
 def save_conversation_turn(
     thread_id: str, user_msg: str, assistant_msg: str, user_id: str | None = None
 ) -> None:
     paths = get_user_paths(user_id)
-    conv_file = paths["conv"] / f"{thread_id}.jsonl"
+    safe_name = _safe_thread_filename(thread_id)
+    conv_file = paths["conv"] / f"{safe_name}.jsonl"
     record = {
         "timestamp": datetime.now().isoformat(),
         "user": user_msg,
@@ -588,7 +691,8 @@ def load_recent_conversation_messages(
 ) -> list[dict[str, str]]:
     """Reload saved messages for a user's thread when returning to the app."""
     paths = get_user_paths(user_id)
-    conv_file = paths["conv"] / f"{thread_id}.jsonl"
+    safe_name = _safe_thread_filename(thread_id)
+    conv_file = paths["conv"] / f"{safe_name}.jsonl"
     if not conv_file.exists():
         return []
     messages: list[dict[str, str]] = []
@@ -599,7 +703,6 @@ def load_recent_conversation_messages(
         messages.append({"role": "user", "content": item["user"]})
         messages.append({"role": "assistant", "content": item["assistant"]})
     return messages
-
 
 def prompt_ephemeral_google_details() -> str:
     print("\n--- Google Mail & Calendar Access (Google Browser Sign-In) ---")
@@ -646,12 +749,13 @@ def main() -> None:
     context_snapshot = load_profile_and_ltm_summary(user_id)
 
     system_prompt = (
-        "You are a personal AI assistant running in VS Code. "
-        "Always address and personalize responses for the active user below. "
-        "Use memory tools when the user shares preferences, ongoing projects, decisions, facts, or daily updates.\n\n"
-        f"{context_snapshot}"
+    "You are a personal AI assistant. "
+    "Tailor your answers to the active user profile below and save updates to their isolated memory. "
+    "Whenever the user asks to check their calendar, schedule, or upcoming events, call "
+    "`list_upcoming_calendar_events`. Whenever they ask to check unread, recent, or specific emails, "
+    "call `search_gmail` with an appropriate Gmail search query.\n\n"
+    f"{context_snapshot}"
     )
-
     agent = create_agent(
         model=llm,
         tools=[

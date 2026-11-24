@@ -22,3 +22,6 @@ memory/
 .vscode/
 .DS_Store
 Thumbs.db
+
+.streamlit/secrets.toml
+secrets.toml
