@@ -14,38 +14,35 @@ from agent_full import (
 )
 
 
-@st.cache_resource
-def get_pending_oauth_states() -> Dict[str, float]:
-    return {}
-
-
 def handle_oauth_callback() -> None:
     params = st.query_params
     if "error" in params:
-        st.error(f"Google authentication error: {params['error']}")
+        st.session_state["oauth_error"] = (
+            f"Google returned an error: {params.get('error')} "
+            f"({params.get('error_description', 'no extra details')})"
+        )
         st.query_params.clear()
-        return
+        st.rerun()
 
     if "code" not in params or "state" not in params:
         return
 
     try:
         cred_dict, email = exchange_oauth_code(
-            code=params["code"],
-            received_state=params["state"],
-            client_id=st.secrets["GOOGLE_CLIENT_ID"],
-            client_secret=st.secrets["GOOGLE_CLIENT_SECRET"],
-            redirect_uri=st.secrets["REDIRECT_URI"],
-            pending_states=get_pending_oauth_states(),
+            code=str(params["code"]),
+            received_state=str(params["state"]),
+            client_id=str(st.secrets["GOOGLE_CLIENT_ID"]),
+            client_secret=str(st.secrets["GOOGLE_CLIENT_SECRET"]),
+            redirect_uri=str(st.secrets["REDIRECT_URI"]),
         )
         st.session_state["google_creds"] = cred_dict
         st.session_state["user_email"] = email
+        st.session_state.pop("oauth_error", None)
     except Exception as exc:
-        st.error(f"OAuth callback failed: {exc}")
+        st.session_state["oauth_error"] = f"{type(exc).__name__}: {exc}"
     finally:
         st.query_params.clear()
         st.rerun()
-
 
 def disconnect_google() -> None:
     raw = st.session_state.get("google_creds")
@@ -87,10 +84,9 @@ with st.sidebar:
     if not raw_creds:
         st.info("Connect your Google account to let the agent read your meeting locations.")
         auth_url = create_authorization_url(
-            client_id=st.secrets["GOOGLE_CLIENT_ID"],
-            client_secret=st.secrets["GOOGLE_CLIENT_SECRET"],
-            redirect_uri=st.secrets["REDIRECT_URI"],
-            pending_states=get_pending_oauth_states(),
+            client_id=str(st.secrets["GOOGLE_CLIENT_ID"]),
+            client_secret=str(st.secrets["GOOGLE_CLIENT_SECRET"]),
+            redirect_uri=str(st.secrets["REDIRECT_URI"]),
         )
         st.link_button("Connect Google Account", auth_url, use_container_width=True)
     else:
@@ -125,6 +121,21 @@ st.title("Personal Agent Chat (Calendar + Ride Fare Comparison)")
 for item in st.session_state["chat_history"]:
     with st.chat_message(item["role"]):
         st.markdown(item["content"])
+
+# Render the error banner whenever st.session_state.get("oauth_error") is set
+if st.session_state.get("oauth_error"):
+    st.error(f"**Google Sign-In Issue:** {st.session_state['oauth_error']}")
+    if st.button("Dismiss Error"):
+        st.session_state.pop("oauth_error", None)
+        st.rerun()
+
+auth_url = create_authorization_url(
+    client_id=str(st.secrets["GOOGLE_CLIENT_ID"]),
+    client_secret=str(st.secrets["GOOGLE_CLIENT_SECRET"]),
+    redirect_uri=str(st.secrets["REDIRECT_URI"]),
+)
+st.link_button("Connect Google Account", auth_url, use_container_width=True)
+
 
 # Handle new chat prompt
 prompt = st.chat_input("Ask about meetings or compare Rapido, Ola, Uber & SV Green fares...")

@@ -4,7 +4,10 @@ import math
 import os
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
-
+import base64
+import hashlib
+import hmac
+import time
 import requests
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -41,10 +44,8 @@ def create_authorization_url(
     client_id: str,
     client_secret: str,
     redirect_uri: str,
-    pending_states: Dict[str, float],
 ) -> str:
-    state = secrets.token_urlsafe(32)
-    pending_states[state] = dt.datetime.now(dt.timezone.utc).timestamp()
+    state = create_signed_state(client_secret)
 
     flow = Flow.from_client_config(
         build_client_config(client_id, client_secret, redirect_uri),
@@ -66,11 +67,9 @@ def exchange_oauth_code(
     client_id: str,
     client_secret: str,
     redirect_uri: str,
-    pending_states: Dict[str, float],
 ) -> Tuple[Dict[str, Any], str]:
-    if received_state not in pending_states:
+    if not verify_signed_state(received_state, client_secret):
         raise ValueError("Invalid or expired OAuth state parameter.")
-    del pending_states[received_state]
 
     flow = Flow.from_client_config(
         build_client_config(client_id, client_secret, redirect_uri),
@@ -137,6 +136,35 @@ def fetch_upcoming_meetings(
             }
         )
     return meetings
+
+def _oauth_signing_key(client_secret: str) -> bytes:
+    return hashlib.sha256(f"oauth-state:{client_secret}".encode("utf-8")).digest()
+
+
+def create_signed_state(client_secret: str, ttl_seconds: int = 900) -> str:
+    """Create a stateless, tamper-evident OAuth state token with expiry."""
+    exp = int(time.time()) + ttl_seconds
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{exp}.{nonce}".encode("utf-8")
+    sig = hmac.new(_oauth_signing_key(client_secret), payload, hashlib.sha256).hexdigest()
+    token = f"{exp}.{nonce}.{sig}".encode("utf-8")
+    return base64.urlsafe_b64encode(token).decode("ascii")
+
+
+def verify_signed_state(state: str, client_secret: str) -> bool:
+    """Verify HMAC signature and expiration without needing shared server memory."""
+    try:
+        decoded = base64.urlsafe_b64decode(state.encode("ascii")).decode("utf-8")
+        exp_str, nonce, sig = decoded.split(".", 2)
+        if not nonce or int(time.time()) > int(exp_str):
+            return False
+        payload = f"{exp_str}.{nonce}".encode("utf-8")
+        expected_sig = hmac.new(
+            _oauth_signing_key(client_secret), payload, hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(sig, expected_sig)
+    except Exception:
+        return False
 
 def search_gmail_messages_raw(
     creds: Credentials,
