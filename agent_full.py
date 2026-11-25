@@ -1,13 +1,14 @@
+import base64
 import datetime as dt
+import hashlib
+import hmac
 import json
 import math
 import os
 import secrets
-from typing import Any, Dict, List, Optional, Tuple
-import base64
-import hashlib
-import hmac
 import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -40,23 +41,75 @@ def build_client_config(
     }
 
 
+def _oauth_signing_key(client_secret: str) -> bytes:
+    return hashlib.sha256(f"oauth-state:{client_secret}".encode("utf-8")).digest()
+
+
+def create_signed_state(
+    client_secret: str, code_verifier: str, ttl_seconds: int = 900
+) -> str:
+    """Create a stateless, tamper-evident OAuth state token containing PKCE verifier + expiry."""
+    exp = int(time.time()) + ttl_seconds
+    nonce = secrets.token_urlsafe(16)
+    encoded_verifier = base64.urlsafe_b64encode(
+        code_verifier.encode("utf-8")
+    ).decode("ascii")
+    payload = f"{exp}.{nonce}.{encoded_verifier}".encode("utf-8")
+    sig = hmac.new(
+        _oauth_signing_key(client_secret), payload, hashlib.sha256
+    ).hexdigest()
+    token = f"{exp}.{nonce}.{encoded_verifier}.{sig}".encode("utf-8")
+    return base64.urlsafe_b64encode(token).decode("ascii")
+
+
+def verify_and_extract_state(state: str, client_secret: str) -> Optional[str]:
+    """Verify HMAC signature and expiration; return code_verifier if valid."""
+    try:
+        decoded = base64.urlsafe_b64decode(state.encode("ascii")).decode("utf-8")
+        exp_str, nonce, encoded_verifier, sig = decoded.split(".", 3)
+        if not nonce or not encoded_verifier or int(time.time()) > int(exp_str):
+            return None
+        payload = f"{exp_str}.{nonce}.{encoded_verifier}".encode("utf-8")
+        expected_sig = hmac.new(
+            _oauth_signing_key(client_secret), payload, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        return base64.urlsafe_b64decode(encoded_verifier.encode("ascii")).decode(
+            "utf-8"
+        )
+    except Exception:
+        return None
+
+
 def create_authorization_url(
     client_id: str,
     client_secret: str,
     redirect_uri: str,
 ) -> str:
-    state = create_signed_state(client_secret)
+    code_verifier = secrets.token_urlsafe(64)
+    state = create_signed_state(client_secret, code_verifier=code_verifier)
 
     flow = Flow.from_client_config(
         build_client_config(client_id, client_secret, redirect_uri),
         scopes=SCOPES,
         redirect_uri=redirect_uri,
+        autogenerate_code_verifier=False,
+    )
+    code_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode("ascii")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
     )
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         state=state,
         prompt="consent",
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
     )
     return auth_url
 
@@ -68,7 +121,8 @@ def exchange_oauth_code(
     client_secret: str,
     redirect_uri: str,
 ) -> Tuple[Dict[str, Any], str]:
-    if not verify_signed_state(received_state, client_secret):
+    code_verifier = verify_and_extract_state(received_state, client_secret)
+    if not code_verifier:
         raise ValueError("Invalid or expired OAuth state parameter.")
 
     flow = Flow.from_client_config(
@@ -76,8 +130,9 @@ def exchange_oauth_code(
         scopes=SCOPES,
         state=received_state,
         redirect_uri=redirect_uri,
+        autogenerate_code_verifier=False,
     )
-    flow.fetch_token(code=code)
+    flow.fetch_token(code=code, code_verifier=code_verifier)
     creds = flow.credentials
 
     oauth2_service = build("oauth2", "v2", credentials=creds)
@@ -86,7 +141,8 @@ def exchange_oauth_code(
     cred_dict = {
         "token": creds.token,
         "refresh_token": creds.refresh_token,
-        "token_uri": getattr(creds, "token_uri", None) or "https://oauth2.googleapis.com/token",
+        "token_uri": getattr(creds, "token_uri", None)
+        or "https://oauth2.googleapis.com/token",
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": list(creds.scopes or []),
@@ -137,34 +193,6 @@ def fetch_upcoming_meetings(
         )
     return meetings
 
-def _oauth_signing_key(client_secret: str) -> bytes:
-    return hashlib.sha256(f"oauth-state:{client_secret}".encode("utf-8")).digest()
-
-
-def create_signed_state(client_secret: str, ttl_seconds: int = 900) -> str:
-    """Create a stateless, tamper-evident OAuth state token with expiry."""
-    exp = int(time.time()) + ttl_seconds
-    nonce = secrets.token_urlsafe(16)
-    payload = f"{exp}.{nonce}".encode("utf-8")
-    sig = hmac.new(_oauth_signing_key(client_secret), payload, hashlib.sha256).hexdigest()
-    token = f"{exp}.{nonce}.{sig}".encode("utf-8")
-    return base64.urlsafe_b64encode(token).decode("ascii")
-
-
-def verify_signed_state(state: str, client_secret: str) -> bool:
-    """Verify HMAC signature and expiration without needing shared server memory."""
-    try:
-        decoded = base64.urlsafe_b64decode(state.encode("ascii")).decode("utf-8")
-        exp_str, nonce, sig = decoded.split(".", 2)
-        if not nonce or int(time.time()) > int(exp_str):
-            return False
-        payload = f"{exp_str}.{nonce}".encode("utf-8")
-        expected_sig = hmac.new(
-            _oauth_signing_key(client_secret), payload, hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(sig, expected_sig)
-    except Exception:
-        return False
 
 def search_gmail_messages_raw(
     creds: Credentials,
@@ -212,6 +240,7 @@ def search_gmail_messages_raw(
             }
         )
     return results
+
 
 def geocode_place(place: str) -> Optional[Tuple[float, float, str]]:
     resp = requests.get(
