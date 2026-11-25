@@ -26,6 +26,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 def build_client_config(
     client_id: str, client_secret: str, redirect_uri: str
