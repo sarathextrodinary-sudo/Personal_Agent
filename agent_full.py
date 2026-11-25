@@ -291,24 +291,25 @@ def get_route_distance_and_duration(
 def compare_ride_fares(
     distance_km: float, duration_min: float, surge_multiplier: float = 1.0
 ) -> List[Dict[str, Any]]:
+    # Format: (provider, ride_type, mode, base_inr, per_km_inr, per_min_inr, min_fare_inr)
     rate_cards = [
-        ("Rapido", "Bike Taxi", "Bike", 15, 6.5, 0.5, 25),
-        ("Rapido", "Auto", "Auto", 25, 11.0, 1.0, 35),
-        ("Rapido", "Cab Economy", "Cab", 45, 14.5, 1.2, 65),
-        ("Ola", "Bike", "Bike", 18, 7.0, 0.5, 28),
-        ("Ola", "Auto", "Auto", 28, 12.0, 1.0, 40),
-        ("Ola", "Mini / Prime", "Cab", 55, 16.0, 1.5, 80),
-        ("Uber", "Moto", "Bike", 18, 7.2, 0.6, 30),
-        ("Uber", "Auto", "Auto", 30, 12.5, 1.1, 45),
-        ("Uber", "Uber Go", "Cab", 58, 16.5, 1.5, 85),
-        ("SV Green", "EV Sedan / SUV", "EV Cab", 50, 14.0, 1.0, 75),
+        ("Rapido", "Bike Taxi", "Bike", 15.0, 6.0, 0.5, 25),
+        ("Ola", "Bike", "Bike", 18.0, 6.5, 0.5, 25),
+        ("Uber", "Moto", "Bike", 18.0, 7.0, 0.5, 28),
+        ("Rapido", "Auto", "Auto", 25.0, 11.0, 1.0, 35),
+        ("Ola", "Auto", "Auto", 28.0, 12.0, 1.0, 40),
+        ("Uber", "Auto", "Auto", 30.0, 12.5, 1.0, 40),
+        ("Rapido", "Cab Economy", "Cab", 45.0, 14.0, 1.0, 65),
+        ("Ola", "Mini / Prime", "Cab", 50.0, 15.0, 1.2, 75),
+        ("Uber", "Uber Go", "Cab", 55.0, 16.0, 1.2, 80),
+        ("GREEN SM", "EV Sedan / SUV", "EV Cab", 50.0, 14.0, 1.0, 75),
     ]
     rows: List[Dict[str, Any]] = []
     for provider, category, mode, base, per_km, per_min, min_fare in rate_cards:
-        raw = (base + distance_km * per_km + duration_min * per_min) * surge_multiplier
-        est = max(min_fare, round(raw))
-        low = max(min_fare, int(est * 0.92))
-        high = int(est * 1.12)
+        raw_est = (base + (distance_km * per_km) + (duration_min * per_min)) * surge_multiplier
+        est = max(min_fare, round(raw_est))
+        low = max(min_fare, int(round(est * 0.95)))
+        high = max(low, int(round(est * 1.08)))
         rows.append(
             {
                 "provider": provider,
@@ -353,7 +354,7 @@ def build_commute_agent(
         destination_location: str,
         surge_multiplier: float = 1.0,
     ) -> str:
-        """Compare estimated bike, auto, cab, and EV cab fares across Rapido, Ola, Uber, and SV Green between pickup_location and destination_location."""
+        """Compare estimated bike, auto, cab, and EV cab fares across Rapido, Ola, Uber, and GREEN SM between pickup_location and destination_location."""
         origin_geo = geocode_place(pickup_location)
         dest_geo = geocode_place(destination_location)
         if not origin_geo or not dest_geo:
@@ -412,8 +413,8 @@ def build_commute_agent(
         "When a user asks to check, find, or summarize emails, call `search_gmail_messages` "
         "with a concise Gmail search query. "
         "When comparing ride prices between two places or to an office/meeting venue, "
-        "call `compare_commute_fares` and present a clear comparison across Rapido, Ola, Uber, and SV Green "
-        "in INR (₹), noting that fares are estimates rather than live metered quotes."
+        "call `compare_commute_fares` and present a clear comparison across Rapido, Ola, Uber, and GREEN SM "
+        "in INR (₹), noting that fares are rough estimates rather than live app quotes."
     )
 
     return create_agent(
