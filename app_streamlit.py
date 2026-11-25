@@ -1,5 +1,4 @@
-﻿import datetime as dt
-from typing import Dict, List
+﻿from typing import Dict, List
 
 import requests
 import streamlit as st
@@ -7,9 +6,9 @@ import streamlit as st
 from agent_full import (
     build_commute_agent,
     create_authorization_url,
+    creds_from_dict,
     exchange_oauth_code,
     fetch_upcoming_meetings,
-    creds_from_dict,
     run_agent_turn,
 )
 
@@ -44,6 +43,7 @@ def handle_oauth_callback() -> None:
         st.query_params.clear()
         st.rerun()
 
+
 def disconnect_google() -> None:
     raw = st.session_state.get("google_creds")
     if raw and raw.get("token"):
@@ -62,7 +62,6 @@ def disconnect_google() -> None:
 st.set_page_config(page_title="Personal Agent — Calendar & Commute", layout="wide")
 handle_oauth_callback()
 
-st.session_state.setdefault("chat_history", [])
 st.session_state.setdefault(
     "chat_history",
     [
@@ -117,25 +116,17 @@ with st.sidebar:
 
 st.title("Personal Agent Chat (Calendar + Ride Fare Comparison)")
 
-# Render existing conversation
-for item in st.session_state["chat_history"]:
-    with st.chat_message(item["role"]):
-        st.markdown(item["content"])
-
-# Render the error banner whenever st.session_state.get("oauth_error") is set
+# Render error banner if OAuth callback hit an error
 if st.session_state.get("oauth_error"):
     st.error(f"**Google Sign-In Issue:** {st.session_state['oauth_error']}")
     if st.button("Dismiss Error"):
         st.session_state.pop("oauth_error", None)
         st.rerun()
 
-auth_url = create_authorization_url(
-    client_id=str(st.secrets["GOOGLE_CLIENT_ID"]),
-    client_secret=str(st.secrets["GOOGLE_CLIENT_SECRET"]),
-    redirect_uri=str(st.secrets["REDIRECT_URI"]),
-)
-st.link_button("Connect Google Account", auth_url, use_container_width=True)
-
+# Render existing conversation
+for item in st.session_state["chat_history"]:
+    with st.chat_message(item["role"]):
+        st.markdown(item["content"])
 
 # Handle new chat prompt
 prompt = st.chat_input("Ask about meetings or compare Rapido, Ola, Uber & SV Green fares...")
@@ -147,8 +138,9 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("Checking calendar & comparing ride options..."):
             agent = build_commute_agent(
-                groq_api_key=st.secrets["GROQ_API_KEY"],
+                groq_api_key=str(st.secrets["GROQ_API_KEY"]),
                 creds_dict=st.session_state.get("google_creds"),
+                model_name=str(st.secrets.get("GROQ_MODEL", "llama-3.3-70b-versatile")),
             )
             prior_history: List[Dict[str, str]] = st.session_state["chat_history"][:-1]
             reply, tool_events = run_agent_turn(agent, prior_history, prompt)
