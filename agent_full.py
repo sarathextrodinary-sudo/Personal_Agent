@@ -9,6 +9,7 @@ import random
 import secrets
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -28,64 +29,119 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
-NAKSHATRAS = [
-    "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
-    "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni", "Uttara Phalguni",
-    "Hasta", "Chitra", "Swati", "Vishakha", "Anuradha", "Jyeshtha",
-    "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana", "Dhanishta",
-    "Shatabhisha", "Purva Bhadrapada", "Uttara Bhadrapada", "Revati",
+NAKSHATRA_TRIADS: List[Tuple[str, List[str]]] = [
+    ("Ketu", ["Ashwini", "Magha", "Mula"]),
+    ("Venus", ["Bharani", "Purva Phalguni", "Purva Ashadha"]),
+    ("Sun", ["Krittika", "Uttara Phalguni", "Uttara Ashadha"]),
+    ("Moon", ["Rohini", "Hasta", "Shravana"]),
+    ("Mars", ["Mrigashira", "Chitra", "Dhanishta"]),
+    ("Rahu", ["Ardra", "Swati", "Shatabhisha"]),
+    ("Jupiter", ["Punarvasu", "Vishakha", "Purva Bhadrapada"]),
+    ("Saturn", ["Pushya", "Anuradha", "Uttara Bhadrapada"]),
+    ("Mercury", ["Ashlesha", "Jyeshtha", "Revati"]),
 ]
 
-# Replace or extend this dictionary once you share your full dataset
-DEFAULT_STAR_DATASET: Dict[str, Dict[str, str]] = {
-    "Janma (1st / 10th / 19th)": {
-        "outlook": "Mixed / Caution",
-        "guidance": "Good for routine self-care and planning; avoid impulsive risks or heated arguments.",
+DEFAULT_STAR_DATASET: Dict[int, Dict[str, Any]] = {
+    1: {
+        "tara_name": "Janma Tara",
+        "tara_telugu": "జన్మతార",
+        "lord": "Sun (సూర్యుడు)",
+        "vahana": "Peacock (నెమలి)",
+        "is_favorable": False,
+        "outlook": "Unfavorable / Caution",
+        "dosha_duration": "~3 hours",
+        "effects": "Mental distress, restlessness, headache, and difficulty with food or proper sleep.",
+        "remedy_or_note": "Donating a pumpkin (గుమ్మడిపండు) brings some relief. Avoid for auspicious events in the 1st Navaka.",
     },
-    "Sampat (2nd / 11th / 20th)": {
-        "outlook": "Very Favorable",
-        "guidance": "Strong day for financial decisions, purchases, networking, and productive meetings.",
+    2: {
+        "tara_name": "Sampat Tara",
+        "tara_telugu": "సంపత్తార",
+        "lord": "Mercury (బుధుడు)",
+        "vahana": "Horse (గుఱ్ఱము)",
+        "is_favorable": True,
+        "outlook": "Favorable (Good)",
+        "dosha_duration": "None",
+        "effects": "Gains of all kinds, good financial income, business/trade efforts can succeed, and sensible judgment across matters.",
+        "remedy_or_note": "Favorable Tara.",
     },
-    "Vipat (3rd / 12th / 21st)": {
-        "outlook": "Challenging",
-        "guidance": "Double-check travel plans, communications, and commitments; keep a calm pace.",
+    3: {
+        "tara_name": "Vipat Tara",
+        "tara_telugu": "విపత్తార",
+        "lord": "Rahu (రాహువు)",
+        "vahana": "Goat (మేక)",
+        "is_favorable": False,
+        "outlook": "Unfavorable / Caution",
+        "dosha_duration": "~1 hour",
+        "effects": "Baseless quarrels, associating with people beneath one's standing, and physical discomforts.",
+        "remedy_or_note": "Do not donate jaggery (బెల్లం). Avoid for auspicious events in the 2nd Navaka.",
     },
-    "Kshema (4th / 13th / 22nd)": {
-        "outlook": "Favorable",
-        "guidance": "Supportive for stability, family matters, learning, and steady progress.",
+    4: {
+        "tara_name": "Kshema Tara",
+        "tara_telugu": "క్షేమతార",
+        "lord": "Jupiter (గురుడు)",
+        "vahana": "Elephant (ఏనుగు)",
+        "is_favorable": True,
+        "outlook": "Favorable (Good)",
+        "dosha_duration": "None",
+        "effects": "Participating in sacred/religious activities, meeting new people, gaining social respect and hospitality, and steady income.",
+        "remedy_or_note": "Favorable Tara.",
     },
-    "Pratyak (5th / 14th / 23rd)": {
-        "outlook": "Moderate Obstacles",
-        "guidance": "Expect minor delays; stick to familiar workflows and postpone high-stakes negotiations.",
+    5: {
+        "tara_name": "Pratyak Tara",
+        "tara_telugu": "ప్రత్యక్తార",
+        "lord": "Ketu (కేతువు)",
+        "vahana": "Crow (కాకి)",
+        "is_favorable": False,
+        "outlook": "Unfavorable / Caution",
+        "dosha_duration": "~3 hours",
+        "effects": "Harsh remarks from others, plans not clicking, and unexpected obstacles in tasks.",
+        "remedy_or_note": "Do not donate salt (ఉప్పు). Avoid for auspicious events in the 3rd Navaka.",
     },
-    "Sadhana (6th / 15th / 24th)": {
-        "outlook": "Highly Favorable",
-        "guidance": "Excellent for completing pending tasks, interviews, execution, and achieving goals.",
+    6: {
+        "tara_name": "Sadhana Tara",
+        "tara_telugu": "సాధనతార",
+        "lord": "Moon (చంద్రుడు)",
+        "vahana": "Fox (నక్క)",
+        "is_favorable": True,
+        "outlook": "Favorable (Good)",
+        "dosha_duration": "None",
+        "effects": "Meeting accomplished/eminent people, a calm and peaceful mind, and meeting new women.",
+        "remedy_or_note": "Favorable Tara.",
     },
-    "Naidhana (7th / 16th / 25th)": {
-        "outlook": "Caution",
-        "guidance": "Prioritize rest, health, and low-risk work; avoid major new beginnings.",
+    7: {
+        "tara_name": "Naidhana Tara",
+        "tara_telugu": "నైధనతార",
+        "lord": "Shani / Saturn (శని)",
+        "vahana": "Lion (సింహము)",
+        "is_favorable": False,
+        "outlook": "Unfavorable / Caution",
+        "dosha_duration": "~3 hours",
+        "effects": "Getting pulled into unnecessary disputes, arguments, and counter-arguments.",
+        "remedy_or_note": "Donating gold (సువర్ణదానము) brings some relief. Avoid across all Navakas for auspicious events.",
     },
-    "Mitra (8th / 17th / 26th)": {
-        "outlook": "Favorable",
-        "guidance": "Great for teamwork, collaborations, reaching out to friends, and creative work.",
+    8: {
+        "tara_name": "Mitra Tara",
+        "tara_telugu": "మిత్రతార",
+        "lord": "Shukra / Venus (శుక్రుడు)",
+        "vahana": "Garuda (గరుత్మంతుడు)",
+        "is_favorable": True,
+        "outlook": "Favorable (Good)",
+        "dosha_duration": "None",
+        "effects": "Interest in music and literature, harmony with women/spouse, meeting new people, good income, and scholarly/scriptural discussions.",
+        "remedy_or_note": "Favorable Tara.",
     },
-    "Parama Mitra (9th / 18th / 27th)": {
-        "outlook": "Very Favorable",
-        "guidance": "Auspicious for important discussions, travel, learning, and long-term initiatives.",
+    9: {
+        "tara_name": "Parama Maitra Tara",
+        "tara_telugu": "పరమమైత్రతార",
+        "lord": "Kuja / Mars (కుజుడు)",
+        "vahana": "Swan (హంస)",
+        "is_favorable": True,
+        "outlook": "Favorable (Good)",
+        "dosha_duration": "None",
+        "effects": "Possible unexpected hassles alongside enthusiasm for bold/adventurous actions, detachment, and low desire to dominate others.",
+        "remedy_or_note": "Favorable Tara.",
     },
 }
-
-TARA_KEYS = list(DEFAULT_STAR_DATASET.keys())
-
-# Replace or extend this list with your own facts dataset
-DEFAULT_FACTS_DATASET: List[str] = [
-    "A day on Venus is longer than a year on Venus because it rotates on its axis more slowly than it orbits the Sun.",
-    "Octopuses have three hearts, nine brains, and blue copper-based blood.",
-    "Honey never spoils when kept sealed and dry—archaeologists have found pots of honey thousands of years old that were still edible.",
-    "Bananas are berries botanically, whereas strawberries are not.",
-    "Water can boil and freeze at the same time under the right combination of temperature and pressure (the triple point).",
-]
 
 DEFAULT_FACTS_DATASET: List[str] = [
     (
@@ -125,6 +181,19 @@ DEFAULT_FACTS_DATASET: List[str] = [
     ),
 ]
 
+DEFAULT_HR_POLICY: Dict[str, Any] = {
+    "daily_limits_inr": {
+        "Transport - Bike/Auto": 500.0,
+        "Transport - Cab/EV": 1500.0,
+        "Meals & Per Diem": 1000.0,
+        "Client Hospitality": 2500.0,
+        "Miscellaneous": 500.0,
+    },
+    "receipt_required_above_inr": 250.0,
+    "allow_without_receipt_below_threshold": True,
+}
+
+
 def pick_surprise_fact(
     custom_facts: Optional[List[str]] = None,
     exclude_fact: Optional[str] = None,
@@ -157,7 +226,6 @@ def _oauth_signing_key(client_secret: str) -> bytes:
 def create_signed_state(
     client_secret: str, code_verifier: str, ttl_seconds: int = 900
 ) -> str:
-    """Create a stateless, tamper-evident OAuth state token containing PKCE verifier + expiry."""
     exp = int(time.time()) + ttl_seconds
     nonce = secrets.token_urlsafe(16)
     encoded_verifier = base64.urlsafe_b64encode(
@@ -172,7 +240,6 @@ def create_signed_state(
 
 
 def verify_and_extract_state(state: str, client_secret: str) -> Optional[str]:
-    """Verify HMAC signature and expiration; return code_verifier if valid."""
     try:
         decoded = base64.urlsafe_b64decode(state.encode("ascii")).decode("utf-8")
         exp_str, nonce, encoded_verifier, sig = decoded.split(".", 3)
@@ -308,7 +375,6 @@ def search_gmail_messages_raw(
     query: str = "",
     max_results: int = 5,
 ) -> List[Dict[str, str]]:
-    """Search Gmail messages using standard Gmail search syntax."""
     service = build("gmail", "v1", credentials=creds)
     safe_limit = max(1, min(int(max_results), 10))
 
@@ -470,176 +536,6 @@ def find_nearby_tourist_places(area: str, limit: int = 6) -> List[Dict[str, Any]
     return places
 
 
-def evaluate_natal_star_day(
-    natal_star: str,
-    todays_star: str,
-    custom_dataset: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    norm_map = {s.lower(): idx for idx, s in enumerate(NAKSHATRAS)}
-    n_idx = norm_map.get(natal_star.strip().lower())
-    t_idx = norm_map.get(todays_star.strip().lower())
-    if n_idx is None or t_idx is None:
-        return {"error": f"Unknown star name. Choose from: {', '.join(NAKSHATRAS)}"}
-
-    count = ((t_idx - n_idx) % 27) + 1
-    tara_index = (count - 1) % 9
-    tara_label = TARA_KEYS[tara_index]
-
-    dataset = custom_dataset if custom_dataset else DEFAULT_STAR_DATASET
-    entry = (
-        dataset.get(natal_star)
-        or dataset.get(tara_label)
-        or DEFAULT_STAR_DATASET[tara_label]
-    )
-    return {
-        "natal_star": NAKSHATRAS[n_idx],
-        "todays_star": NAKSHATRAS[t_idx],
-        "star_count_from_janma": count,
-        "tara_category": tara_label,
-        "prediction": entry,
-    }
-
-NAKSHATRA_TRIADS: List[Tuple[str, List[str]]] = [
-    ("Ketu", ["Ashwini", "Magha", "Mula"]),
-    ("Venus", ["Bharani", "Purva Phalguni", "Purva Ashadha"]),
-    ("Sun", ["Krittika", "Uttara Phalguni", "Uttara Ashadha"]),
-    ("Moon", ["Rohini", "Hasta", "Shravana"]),
-    ("Mars", ["Mrigashira", "Chitra", "Dhanishta"]),
-    ("Rahu", ["Ardra", "Swati", "Shatabhisha"]),
-    ("Jupiter", ["Punarvasu", "Vishakha", "Purva Bhadrapada"]),
-    ("Saturn", ["Pushya", "Anuradha", "Uttara Bhadrapada"]),
-    ("Mercury", ["Ashlesha", "Jyeshtha", "Revati"]),
-]
-
-DEFAULT_STAR_DATASET: Dict[int, Dict[str, Any]] = {
-    1: {
-        "tara_name": "Janma Tara",
-        "tara_telugu": "జన్మతార",
-        "lord": "Sun (సూర్యుడు)",
-        "vahana": "Peacock (నెమలి)",
-        "is_favorable": False,
-        "outlook": "Unfavorable / Caution",
-        "dosha_duration": "~3 hours",
-        "effects": (
-            "Mental distress, restlessness, headache, and difficulty with food or proper sleep."
-        ),
-        "remedy_or_note": (
-            "Donating a pumpkin (గుమ్మడిపండు) brings some relief. Avoid for auspicious events in the 1st Navaka."
-        ),
-    },
-    2: {
-        "tara_name": "Sampat Tara",
-        "tara_telugu": "సంపత్తార",
-        "lord": "Mercury (బుధుడు)",
-        "vahana": "Horse (గుఱ్ఱము)",
-        "is_favorable": True,
-        "outlook": "Favorable (Good)",
-        "dosha_duration": "None",
-        "effects": (
-            "Gains of all kinds, good financial income, business/trade efforts can succeed, and sensible judgment across matters."
-        ),
-        "remedy_or_note": "Favorable Tara.",
-    },
-    3: {
-        "tara_name": "Vipat Tara",
-        "tara_telugu": "విపత్తార",
-        "lord": "Rahu (రాహువు)",
-        "vahana": "Goat (మేక)",
-        "is_favorable": False,
-        "outlook": "Unfavorable / Caution",
-        "dosha_duration": "~1 hour",
-        "effects": (
-            "Baseless quarrels, associating with people beneath one's standing, and physical discomforts."
-        ),
-        "remedy_or_note": (
-            "Do not donate jaggery (బెల్లం). Avoid for auspicious events in the 2nd Navaka."
-        ),
-    },
-    4: {
-        "tara_name": "Kshema Tara",
-        "tara_telugu": "క్షేమతార",
-        "lord": "Jupiter (గురుడు)",
-        "vahana": "Elephant (ఏనుగు)",
-        "is_favorable": True,
-        "outlook": "Favorable (Good)",
-        "dosha_duration": "None",
-        "effects": (
-            "Participating in sacred/religious activities, meeting new people, gaining social respect and hospitality, and steady income."
-        ),
-        "remedy_or_note": "Favorable Tara.",
-    },
-    5: {
-        "tara_name": "Pratyak Tara",
-        "tara_telugu": "ప్రత్యక్తార",
-        "lord": "Ketu (కేతువు)",
-        "vahana": "Crow (కాకి)",
-        "is_favorable": False,
-        "outlook": "Unfavorable / Caution",
-        "dosha_duration": "~3 hours",
-        "effects": (
-            "Harsh remarks from others, plans not clicking, and unexpected obstacles in tasks."
-        ),
-        "remedy_or_note": (
-            "Do not donate salt (ఉప్పు). Avoid for auspicious events in the 3rd Navaka."
-        ),
-    },
-    6: {
-        "tara_name": "Sadhana Tara",
-        "tara_telugu": "సాధనతార",
-        "lord": "Moon (చంద్రుడు)",
-        "vahana": "Fox (నక్క)",
-        "is_favorable": True,
-        "outlook": "Favorable (Good)",
-        "dosha_duration": "None",
-        "effects": (
-            "Meeting accomplished/eminent people, a calm and peaceful mind, and meeting new women."
-        ),
-        "remedy_or_note": "Favorable Tara.",
-    },
-    7: {
-        "tara_name": "Naidhana Tara",
-        "tara_telugu": "నైధనతార",
-        "lord": "Shani / Saturn (శని)",
-        "vahana": "Lion (సింహము)",
-        "is_favorable": False,
-        "outlook": "Unfavorable / Caution",
-        "dosha_duration": "~3 hours",
-        "effects": (
-            "Getting pulled into unnecessary disputes, arguments, and counter-arguments."
-        ),
-        "remedy_or_note": (
-            "Donating gold (సువర్ణదానము) brings some relief. Avoid across all Navakas for auspicious events."
-        ),
-    },
-    8: {
-        "tara_name": "Mitra Tara",
-        "tara_telugu": "మిత్రతార",
-        "lord": "Shukra / Venus (శుక్రుడు)",
-        "vahana": "Garuda (గరుత్మంతుడు)",
-        "is_favorable": True,
-        "outlook": "Favorable (Good)",
-        "dosha_duration": "None",
-        "effects": (
-            "Interest in music and literature, harmony with women/spouse, meeting new people, good income, and scholarly/scriptural discussions."
-        ),
-        "remedy_or_note": "Favorable Tara.",
-    },
-    9: {
-        "tara_name": "Parama Maitra Tara",
-        "tara_telugu": "పరమమైత్రతార",
-        "lord": "Kuja / Mars (కుజుడు)",
-        "vahana": "Swan (హంస)",
-        "is_favorable": True,
-        "outlook": "Favorable (Good)",
-        "dosha_duration": "None",
-        "effects": (
-            "Possible unexpected hassles alongside enthusiasm for bold/adventurous actions, detachment, and low desire to dominate others."
-        ),
-        "remedy_or_note": "Favorable Tara.",
-    },
-}
-
-
 def _triad_index_for_star(star_name: str) -> Optional[int]:
     cleaned = star_name.strip().lower()
     for idx, (_, stars) in enumerate(NAKSHATRA_TRIADS):
@@ -661,10 +557,15 @@ def evaluate_natal_star_day(
             "error": f"Unknown star name. Expected one of: {', '.join(all_stars)}"
         }
 
-    # Cell value 1..9 in the 9x9 Gochara Tara table
     tara_num = ((t_triad - n_triad) % 9) + 1
-    dataset = custom_dataset if custom_dataset else DEFAULT_STAR_DATASET
-    entry = dataset.get(tara_num) or dataset.get(str(tara_num)) or DEFAULT_STAR_DATASET[tara_num]
+    dataset: Dict[Any, Any] = (
+        custom_dataset if custom_dataset is not None else DEFAULT_STAR_DATASET
+    )
+    entry = (
+        dataset.get(tara_num)
+        or dataset.get(str(tara_num))
+        or DEFAULT_STAR_DATASET[tara_num]
+    )
 
     return {
         "natal_star": natal_star.strip(),
@@ -676,12 +577,98 @@ def evaluate_natal_star_day(
     }
 
 
+def tally_expenses_with_hr_policy(
+    entries: List[Dict[str, Any]],
+    hr_policy: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    policy = hr_policy or DEFAULT_HR_POLICY
+    limits: Dict[str, float] = policy.get(
+        "daily_limits_inr", DEFAULT_HR_POLICY["daily_limits_inr"]
+    )
+    receipt_threshold = float(policy.get("receipt_required_above_inr", 250.0))
+
+    daily_bucket_used: Dict[Tuple[str, str], float] = {}
+    evaluated_rows: List[Dict[str, Any]] = []
+
+    total_claimed = 0.0
+    total_eligible = 0.0
+    total_excess = 0.0
+
+    for idx, item in enumerate(entries, start=1):
+        date_str = str(item.get("date", dt.date.today().isoformat()))
+        category = str(item.get("category", "Miscellaneous"))
+        desc = str(item.get("description", ""))
+        amount = round(float(item.get("amount_inr", 0.0)), 2)
+        has_receipt = bool(item.get("receipt", True))
+
+        total_claimed += amount
+        cat_limit = float(limits.get(category, limits.get("Miscellaneous", 500.0)))
+        bucket_key = (date_str, category)
+        already_used = daily_bucket_used.get(bucket_key, 0.0)
+        remaining_cap = max(0.0, cat_limit - already_used)
+
+        notes: List[str] = []
+        if amount > receipt_threshold and not has_receipt:
+            eligible = 0.0
+            status = "Held - Receipt Missing"
+            notes.append(f"Receipt required for claims above ₹{int(receipt_threshold)}.")
+        else:
+            eligible = round(min(amount, remaining_cap), 2)
+            daily_bucket_used[bucket_key] = round(already_used + eligible, 2)
+            if eligible == amount:
+                status = "Within Policy"
+                notes.append(f"Within ₹{int(cat_limit)}/day {category} cap.")
+            elif eligible > 0:
+                status = "Partially Capped"
+                notes.append(
+                    f"Capped at ₹{int(cat_limit)}/day {category} limit (₹{round(amount - eligible, 2)} excess)."
+                )
+            else:
+                status = "Over Daily Limit"
+                notes.append(f"Daily ₹{int(cat_limit)} {category} limit already exhausted.")
+
+        excess = round(amount - eligible, 2)
+        total_eligible += eligible
+        total_excess += excess
+
+        evaluated_rows.append(
+            {
+                "id": idx,
+                "date": date_str,
+                "category": category,
+                "description": desc,
+                "amount_inr": amount,
+                "receipt": "Yes" if has_receipt else "No",
+                "eligible_inr": eligible,
+                "excess_inr": excess,
+                "status": status,
+                "policy_note": " ".join(notes),
+            }
+        )
+
+    return {
+        "summary": {
+            "total_entries": len(evaluated_rows),
+            "total_claimed_inr": round(total_claimed, 2),
+            "total_eligible_inr": round(total_eligible, 2),
+            "total_out_of_policy_inr": round(total_excess, 2),
+        },
+        "policy_applied": policy,
+        "items": evaluated_rows,
+    }
+
+
 def build_commute_agent(
     groq_api_key: str,
     creds_dict: Optional[Dict[str, Any]] = None,
     model_name: str = "llama-3.3-70b-versatile",
+    ledger_entries: Optional[List[Dict[str, Any]]] = None,
+    hr_policy: Optional[Dict[str, Any]] = None,
 ):
-    """Build a LangGraph agent with Calendar, Gmail, Commute Fares, Tourist Places, Natal Star, and Facts tools."""
+    active_ledger: List[Dict[str, Any]] = (
+        ledger_entries if ledger_entries is not None else []
+    )
+    active_policy: Dict[str, Any] = hr_policy or DEFAULT_HR_POLICY
 
     @tool
     def get_calendar_meetings(max_results: int = 8) -> str:
@@ -770,6 +757,33 @@ def build_commute_agent(
         """Select a single surprise fact from the configured facts dataset."""
         return json.dumps({"fact": pick_surprise_fact()})
 
+    @tool
+    def add_expense_to_ledger(
+        category: str,
+        description: str,
+        amount_inr: float,
+        receipt: bool = True,
+        date_iso: str = "",
+    ) -> str:
+        """Record a transport or miscellaneous business trip expense into the employee's ledger and tally against HR policy."""
+        valid_categories = list(active_policy["daily_limits_inr"].keys())
+        chosen_cat = category if category in valid_categories else "Miscellaneous"
+        entry = {
+            "date": date_iso.strip() or dt.date.today().isoformat(),
+            "category": chosen_cat,
+            "description": description.strip(),
+            "amount_inr": round(float(amount_inr), 2),
+            "receipt": bool(receipt),
+        }
+        active_ledger.append(entry)
+        tally = tally_expenses_with_hr_policy(active_ledger, active_policy)
+        return json.dumps({"added": entry, "tally": tally})
+
+    @tool
+    def get_expense_ledger_tally() -> str:
+        """Return all recorded trip expenses tallied against the company's HR reimbursement policy."""
+        return json.dumps(tally_expenses_with_hr_policy(active_ledger, active_policy))
+
     resolved_key = str(groq_api_key or os.environ.get("GROQ_API_KEY") or "").strip()
     llm = ChatGroq(
         model=str(model_name),
@@ -787,7 +801,9 @@ def build_commute_agent(
         "call `compare_commute_fares` and present a clear comparison across Rapido, Ola, Uber, and GREEN SM "
         "in INR (₹), noting that fares are rough estimates rather than live app quotes. "
         "When looking for tourist spots near an area, call `get_tourist_places_near_area`. "
-        "When asked for a surprise fact, call `get_surprise_fact` and present the returned fact directly."
+        "When asked for a surprise fact, call `get_surprise_fact` and present the returned fact directly. "
+        "When the user asks to log a transport/miscellaneous expense or check their reimbursement tally against HR policy, "
+        "call `add_expense_to_ledger` or `get_expense_ledger_tally`."
     )
 
     return create_agent(
@@ -799,6 +815,8 @@ def build_commute_agent(
             get_tourist_places_near_area,
             get_natal_star_outlook,
             get_surprise_fact,
+            add_expense_to_ledger,
+            get_expense_ledger_tally,
         ],
         system_prompt=system_prompt,
     )
@@ -809,7 +827,6 @@ def run_agent_turn(
     history: List[Dict[str, str]],
     user_message: str,
 ) -> Tuple[str, List[Dict[str, str]]]:
-    """Run one conversational turn through LangGraph and return assistant reply + tool trace."""
     lc_messages = []
     for msg in history:
         if msg["role"] == "user":

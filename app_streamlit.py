@@ -1,10 +1,13 @@
-﻿import json
+﻿import datetime as dt
+import json
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import requests
 import streamlit as st
 
 from agent_full import (
+    DEFAULT_HR_POLICY,
     NAKSHATRA_TRIADS,
     build_commute_agent,
     create_authorization_url,
@@ -14,6 +17,7 @@ from agent_full import (
     fetch_upcoming_meetings,
     pick_surprise_fact,
     run_agent_turn,
+    tally_expenses_with_hr_policy,
 )
 
 ALL_NAKSHATRAS: List[str] = [star for _, group in NAKSHATRA_TRIADS for star in group]
@@ -76,6 +80,8 @@ def submit_prompt(prompt_text: str) -> None:
             groq_api_key=str(st.secrets["GROQ_API_KEY"]),
             creds_dict=st.session_state.get("google_creds"),
             model_name=str(st.secrets.get("GROQ_MODEL", "llama-3.3-70b-versatile")),
+            ledger_entries=st.session_state["expense_ledger"],
+            hr_policy=st.session_state["hr_policy"],
         )
         prior_history: List[Dict[str, str]] = st.session_state["chat_history"][:-1]
         reply, tool_events = run_agent_turn(agent, prior_history, cleaned)
@@ -111,6 +117,8 @@ st.session_state.setdefault(
 )
 st.session_state.setdefault("active_panel", None)
 st.session_state.setdefault("last_fact", None)
+st.session_state.setdefault("expense_ledger", [])
+st.session_state.setdefault("hr_policy", json.loads(json.dumps(DEFAULT_HR_POLICY)))
 
 raw_creds = st.session_state.get("google_creds")
 is_connected = bool(raw_creds)
@@ -368,3 +376,111 @@ with bot_right:
         st.session_state["active_panel"] = (
             None if st.session_state["active_panel"] == "fact" else "fact"
         )
+
+# Trip Expense Ledger & HR Reimbursement Tally
+st.divider()
+with st.expander("🧾 Trip Expense Ledger & HR Reimbursement Tally", expanded=False):
+    tab_log, tab_tally, tab_policy = st.tabs(
+        ["Log Expense", "HR Policy Tally & Export", "HR Policy Rules"]
+    )
+
+    with tab_log:
+        c1, c2, c3, c4 = st.columns([1.2, 1.6, 1.1, 0.9])
+        with c1:
+            exp_date = st.date_input("Date", value=dt.date.today(), key="ledger_date")
+        with c2:
+            exp_cat = st.selectbox(
+                "Expense Category",
+                options=list(st.session_state["hr_policy"]["daily_limits_inr"].keys()),
+                key="ledger_cat",
+            )
+        with c3:
+            exp_amt = st.number_input(
+                "Amount (₹)", min_value=1.0, step=10.0, value=150.0, key="ledger_amt"
+            )
+        with c4:
+            exp_receipt = st.checkbox("Receipt Attached", value=True, key="ledger_rcpt")
+
+        exp_desc = st.text_input(
+            "Trip / Expense Description",
+            placeholder="e.g., GREEN SM cab from Hotel to Client Office (HITEC City)",
+            key="ledger_desc",
+        )
+
+        if st.button("Add to Trip Ledger", type="primary", key="add_ledger_btn"):
+            if not exp_desc.strip():
+                st.warning("Please enter a brief description for the expense.")
+            else:
+                st.session_state["expense_ledger"].append(
+                    {
+                        "date": exp_date.isoformat(),
+                        "category": exp_cat,
+                        "description": exp_desc.strip(),
+                        "amount_inr": round(float(exp_amt), 2),
+                        "receipt": bool(exp_receipt),
+                    }
+                )
+                st.success("Expense added and tallied against HR policy.")
+                st.rerun()
+
+    with tab_tally:
+        entries = st.session_state["expense_ledger"]
+        if not entries:
+            st.info(
+                "No expenses logged yet. Add transport or miscellaneous charges in the "
+                "'Log Expense' tab or via chat."
+            )
+        else:
+            tally_report = tally_expenses_with_hr_policy(
+                entries, st.session_state["hr_policy"]
+            )
+            summary = tally_report["summary"]
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Items Logged", summary["total_entries"])
+            m2.metric("Total Claimed", f"₹{summary['total_claimed_inr']:,.2f}")
+            m3.metric("HR Eligible", f"₹{summary['total_eligible_inr']:,.2f}")
+            m4.metric("Out-of-Policy", f"₹{summary['total_out_of_policy_inr']:,.2f}")
+
+            df_tally = pd.DataFrame(tally_report["items"])
+            st.dataframe(df_tally, use_container_width=True, hide_index=True)
+
+            col_dl, col_clr = st.columns([2, 1])
+            with col_dl:
+                st.download_button(
+                    "Download HR Claim CSV",
+                    data=df_tally.to_csv(index=False).encode("utf-8"),
+                    file_name=f"trip_expense_tally_{dt.date.today().isoformat()}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            with col_clr:
+                if st.button("Clear Ledger", use_container_width=True, key="clear_ledger_btn"):
+                    st.session_state["expense_ledger"] = []
+                    st.rerun()
+
+    with tab_policy:
+        st.caption(
+            "Adjust daily category caps (₹) and receipt rules to match your company's HR policy."
+        )
+        updated_limits: Dict[str, float] = {}
+        for cat_name, cap_val in st.session_state["hr_policy"]["daily_limits_inr"].items():
+            updated_limits[cat_name] = st.number_input(
+                f"{cat_name} — Daily Cap (₹)",
+                min_value=0.0,
+                step=50.0,
+                value=float(cap_val),
+                key=f"policy_cap_{cat_name}",
+            )
+        rcpt_limit = st.number_input(
+            "Receipt Mandatory Above (₹)",
+            min_value=0.0,
+            step=50.0,
+            value=float(st.session_state["hr_policy"]["receipt_required_above_inr"]),
+            key="policy_rcpt_limit",
+        )
+        if st.button("Save HR Policy Rules", key="save_hr_policy_btn"):
+            st.session_state["hr_policy"]["daily_limits_inr"] = updated_limits
+            st.session_state["hr_policy"]["receipt_required_above_inr"] = rcpt_limit
+            st.success("HR reimbursement policy updated.")
+            st.rerun()
