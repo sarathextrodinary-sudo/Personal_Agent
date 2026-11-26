@@ -1,0 +1,1 @@
+"Eliminating context-switching and local logistics friction for business travelers on client-site deployments by unifying calendar-aware commute fare comparison, email-based location context, and downtime discovery into one agentic workspace."
